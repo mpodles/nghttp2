@@ -232,6 +232,33 @@ template <typename Memchunk> struct Memchunks {
     len += static_cast<size_t>(last - tail->last);
     tail->last = last;
   }
+  // steal_chunk: take ownership of an already-filled Memchunk without copying.
+  //
+  // The chunk must have been allocated from the same pool as this Memchunks.
+  // |data_begin| and |data_end| must be pointers into chunk->buf that
+  // delimit the valid data written by the caller (e.g. from SSL_read).
+  // After the call the chunk is linked at the tail of this list and the
+  // caller must not touch it again.
+  void steal_chunk(Memchunk *chunk, uint8_t *data_begin, uint8_t *data_end) {
+    assert(data_begin <= data_end);
+    chunk->pos  = data_begin;
+    chunk->last = data_end;
+    chunk->next = nullptr;
+
+    auto n = static_cast<size_t>(data_end - data_begin);
+    if (n == 0) {
+      pool->recycle(chunk);
+      return;
+    }
+
+    if (tail == nullptr) {
+      head = tail = chunk;
+    } else {
+      tail->next = chunk;
+      tail = chunk;
+    }
+    len += n;
+  }
   size_t copy(Memchunks &dest) {
     auto m = head;
     while (m) {
@@ -304,6 +331,72 @@ template <typename Memchunk> struct Memchunks {
     }
 
     return count - left;
+  }
+  // remove_zc: like remove(dest, count) but splices full Memchunks by pointer
+  // instead of byte-copying them, eliminating Copy #3 for full chunks.
+  //
+  // Full chunks (where chunk->len() <= remaining budget) are detached from
+  // this list and appended to dest's tail with zero bytes copied.  Only the
+  // final partial chunk, if any, falls back to dest.append() (a byte copy of
+  // at most chunk_size-1 bytes).  Both Memchunks must share the same pool.
+  //
+  // Returns the number of bytes transferred (same contract as remove(dest,count)).
+  // *out_tail_copied is set to the bytes copied in phase 2 (the residual memcpy);
+  // zero means the entire transfer was zero-copy.
+  size_t remove_zc(Memchunks &dest, size_t count,
+                   size_t *out_tail_copied = nullptr) {
+    assert(pool == dest.pool);
+    assert(mark == nullptr);
+
+    if (!tail || count == 0) {
+      if (out_tail_copied) {
+        *out_tail_copied = 0;
+      }
+      return 0;
+    }
+
+    size_t transferred = 0;
+    auto m = head;
+
+    // Phase 1: splice full chunks — O(1) pointer manipulation per chunk.
+    while (m) {
+      auto mlen = m->len();
+      if (transferred + mlen > count) {
+        break;
+      }
+      auto next = m->next;
+      len -= mlen;
+      m->next = nullptr;
+      if (dest.tail == nullptr) {
+        dest.head = dest.tail = m;
+      } else {
+        dest.tail->next = m;
+        dest.tail = m;
+      }
+      dest.len += mlen;
+      transferred += mlen;
+      m = next;
+    }
+    head = m;
+    if (head == nullptr) {
+      tail = nullptr;
+    }
+
+    // Phase 2: partial last chunk — copy only the remaining bytes.
+    auto remaining = count - transferred;
+    if (m && remaining > 0) {
+      dest.append(m->pos, remaining);
+      m->pos += remaining;
+      len -= remaining;
+      transferred += remaining;
+    } else {
+      remaining = 0;
+    }
+
+    if (out_tail_copied) {
+      *out_tail_copied = remaining;
+    }
+    return transferred;
   }
   size_t remove(Memchunks &dest) {
     assert(pool == dest.pool);

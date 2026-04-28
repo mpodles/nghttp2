@@ -47,6 +47,8 @@
 #include "shrpx_http2_downstream_connection.h"
 #include "shrpx_client_handler.h"
 #include "shrpx_tls.h"
+#include "shrpx_xlio.h"
+#include "shrpx_zcopy_stats.h"
 #include "shrpx_http.h"
 #include "shrpx_worker.h"
 #include "shrpx_connect_blocker.h"
@@ -199,7 +201,9 @@ Http2Session::Http2Session(struct ev_loop *loop, SSL_CTX *ssl_ctx,
     connection_check_state_(ConnectionCheck::NONE),
     freelist_zone_(FreelistZone::NONE),
     settings_recved_(false),
-    allow_connect_proto_(false) {
+    allow_connect_proto_(false),
+    xlio_zcopy_rx_(false),
+    pending_rx_chunk_(nullptr) {
   read_ = write_ = &Http2Session::noop;
 
   on_read_ = &Http2Session::read_noop;
@@ -2062,7 +2066,33 @@ std::expected<void, Error> Http2Session::tls_handshake() {
     return std::unexpected{Error::TLS_VERIFY_PEER};
   }
 
-  read_ = &Http2Session::read_tls;
+  /*
+   * After a successful TLS handshake, check whether XLIO's zero-copy
+   * receive extension is available for this connection.
+   *
+   * We detect UTLS_RX by trying xlio_recv_zc_fd() on the just-connected
+   * socket with max_segs=0 as a capability probe.  ENOTSUP means the fd is
+   * not an XLIO-managed UTLS_RX socket; any other result (including EAGAIN,
+   * meaning "no data yet but the socket is the right type") confirms support.
+   *
+   * If supported, we use read_tls_zcopy() as the read handler.  It
+   * automatically falls back to read_tls() for non-application TLS records.
+   */
+  {
+    auto &xa = XlioAdapter::get();
+    if (xa.has_recv_zc()) {
+      shrpx_xlio_zc_seg probe;
+      int rc = xa.recv_zc(conn_.fd, &probe, 0);
+      /*
+       * rc == -1, errno == EAGAIN → right socket type, no data yet.
+       * rc == -1, errno == ENOTSUP → not a UTLS-RX socket, keep normal path.
+       */
+      xlio_zcopy_rx_ = (rc >= 0 || errno == EAGAIN);
+    }
+  }
+
+  read_  = xlio_zcopy_rx_ ? &Http2Session::read_tls_zcopy
+                           : &Http2Session::read_tls;
   write_ = &Http2Session::write_tls;
 
   if (auto rv = connection_made(); !rv) {
@@ -2076,23 +2106,151 @@ std::expected<void, Error> Http2Session::tls_handshake() {
 std::expected<void, Error> Http2Session::read_tls() {
   conn_.last_read = std::chrono::steady_clock::now();
 
-  std::array<uint8_t, 16_k> rawbuf;
-  auto buf = std::span{rawbuf};
-
   ERR_clear_error();
 
   for (;;) {
+#ifdef SHRPX_ZC_BODY
+    /*
+     * [SHRPX_ZC_BODY] Allocate the read destination from the shared worker
+     * pool instead of the stack.  This makes the buffer a proper Memchunk, so
+     * on_downstream_body() can steal it zero-copy into response_buf_ via
+     * try_claim_rx_chunk() + Memchunks::steal_chunk(), eliminating Copy #5.
+     *
+     * pending_rx_chunk_ is set here and cleared by either:
+     *   (a) on_downstream_body() claiming it (zero-copy path), or
+     *   (b) the recycle() call below (header-only frame path).
+     */
+    auto chunk = worker_->get_mcpool()->get();
+    // Prefetch-for-write: bring the first cache line of the pool chunk into
+    // L1 before SSL_read starts writing.  For sequential writes the hardware
+    // prefetcher takes over after the first line, so one hint is sufficient
+    // to eliminate the cold-start miss that regressed Copy #4.
+    __builtin_prefetch((void *)chunk->buf.data(), /* rw=write */ 1, /* locality */ 3);
+    auto buf = std::span{chunk->buf};
+    pending_rx_chunk_ = chunk;
+#else
+    std::array<uint8_t, 16_k> rawbuf;
+    auto buf = std::span{rawbuf};
+#endif
+
     auto maybe_data = conn_.read_tls(buf);
     if (!maybe_data) {
+#ifdef SHRPX_ZC_BODY
+      worker_->get_mcpool()->recycle(pending_rx_chunk_);
+      pending_rx_chunk_ = nullptr;
+#endif
       return std::unexpected{maybe_data.error()};
     }
 
     auto data = *maybe_data;
     if (data.empty()) {
+#ifdef SHRPX_ZC_BODY
+      worker_->get_mcpool()->recycle(pending_rx_chunk_);
+      pending_rx_chunk_ = nullptr;
+#endif
       return write_tls();
     }
 
     if (auto rv = on_read(data); !rv) {
+#ifdef SHRPX_ZC_BODY
+      if (pending_rx_chunk_) {
+        worker_->get_mcpool()->recycle(pending_rx_chunk_);
+        pending_rx_chunk_ = nullptr;
+      }
+#endif
+      return rv;
+    }
+
+#ifdef SHRPX_ZC_BODY
+    if (pending_rx_chunk_) {
+      worker_->get_mcpool()->recycle(pending_rx_chunk_);
+      pending_rx_chunk_ = nullptr;
+    }
+#endif
+  }
+}
+
+std::expected<void, Error> Http2Session::read_tls_zcopy() {
+  conn_.last_read = std::chrono::steady_clock::now();
+
+  auto &xa = XlioAdapter::get();
+
+  for (;;) {
+    shrpx_xlio_zc_seg segs[SHRPX_XLIO_MAX_SEGS];
+    int nseg = xa.recv_zc(conn_.fd, segs, SHRPX_XLIO_MAX_SEGS);
+
+    if (nseg < 0) {
+      switch (errno) {
+      case EAGAIN:
+        /* No data yet – the libev watcher will fire again when data arrives. */
+        return write_tls();
+
+      case ENODATA:
+        /*
+         * The next buffer in XLIO's queue is a non-application TLS record
+         * (alert, key-update, etc.).  Delegate to SSL_read so OpenSSL can
+         * consume and handle it correctly, then retry the zero-copy path.
+         */
+        if (auto rv = read_tls(); !rv) {
+          return rv;
+        }
+        continue;
+
+      case ENOTSUP:
+        /*
+         * This connection is no longer eligible for zero-copy (shouldn't
+         * normally happen post-handshake, but be defensive).  Revert to the
+         * normal TLS read path permanently for this session.
+         */
+        xlio_zcopy_rx_ = false;
+        read_ = &Http2Session::read_tls;
+        return read_tls();
+
+      default:
+        return std::unexpected{Error::NETWORK};
+      }
+    }
+
+    /*
+     * Feed each zero-copy segment into nghttp2.
+     *
+     * nghttp2_session_mem_recv2() is fully synchronous: it fires all
+     * necessary callbacks before returning.  By the time it returns, the
+     * application has finished reading from segs[i].data.  We can therefore
+     * release the buffer immediately after the call without waiting for an
+     * asynchronous event.
+     *
+     * Design note: we feed segments one at a time rather than combining them
+     * into a single call.  This preserves the ability to release each DMA
+     * buffer as soon as it is consumed, reducing peak memory pressure.  For
+     * the common single-buffer case this is identical in performance.
+     */
+    zcopy_stats().recv_zc_segs.fetch_add(static_cast<uint64_t>(nseg),
+                                         std::memory_order_relaxed);
+
+    for (int i = 0; i < nseg; ++i) {
+      auto data = std::span{static_cast<const uint8_t *>(segs[i].data),
+                            segs[i].len};
+      auto rv = on_read(data);
+
+      /* Release the DMA buffer regardless of parse outcome. */
+      xa.release_zc(segs[i].buf);
+
+      if (!rv) {
+        /* Release remaining buffers before propagating the error. */
+        for (int j = i + 1; j < nseg; ++j) {
+          xa.release_zc(segs[j].buf);
+        }
+        return rv;
+      }
+    }
+
+    /*
+     * After processing all segments, drive the write path so nghttp2 can
+     * send pending WINDOW_UPDATE / SETTINGS_ACK frames that may have been
+     * queued by the callbacks above.
+     */
+    if (auto rv = write_tls(); !rv) {
       return rv;
     }
   }

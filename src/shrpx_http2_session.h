@@ -48,6 +48,7 @@
 
 #include "shrpx_connection.h"
 #include "buffer.h"
+#include "memchunk.h"
 #include "template.h"
 #include "errors.h"
 
@@ -150,6 +151,14 @@ public:
   std::expected<void, Error> write_clear();
   std::expected<void, Error> tls_handshake();
   std::expected<void, Error> read_tls();
+  /**
+   * Zero-copy read path used when XLIO UTLS-RX is active.
+   *
+   * Feeds buffers directly from XLIO's DMA memory into nghttp2 without an
+   * intermediate SSL_read copy.  Falls back to read_tls() for non-data TLS
+   * records (alerts, key-updates) and on any ENOTSUP.
+   */
+  std::expected<void, Error> read_tls_zcopy();
   std::expected<void, Error> write_tls();
   // This is a special write function which just stop write event
   // watcher.
@@ -259,6 +268,22 @@ public:
 
   bool get_allow_connect_proto() const;
 
+  // If |data| points into the current pending_rx_chunk_, return and
+  // relinquish that chunk (caller takes ownership).  Otherwise return
+  // nullptr.  Used by Http2Upstream::on_downstream_body to avoid a copy.
+  Memchunk16K *try_claim_rx_chunk(const uint8_t *data) {
+    auto *chunk = pending_rx_chunk_;
+    if (!chunk) {
+      return nullptr;
+    }
+    auto *base = chunk->buf.data();
+    if (data < base || data >= base + Memchunk16K::size) {
+      return nullptr;
+    }
+    pending_rx_chunk_ = nullptr;
+    return chunk;
+  }
+
   using ReadBuf = Buffer<8_k>;
 
   Http2Session *dlnext, *dlprev;
@@ -305,6 +330,24 @@ private:
   bool settings_recved_;
   // true if peer enables RFC 8441 CONNECT protocol.
   bool allow_connect_proto_;
+  /*
+   * True when the backend TLS connection completed with UTLS-RX hardware
+   * offload AND the XLIO zero-copy receive API is available at runtime.
+   * When set, read_ is pointed at read_tls_zcopy() instead of read_tls().
+   */
+  bool xlio_zcopy_rx_;
+
+  /*
+   * Pool chunk used as the SSL_read destination in the current read_tls()
+   * iteration.  A pointer into this chunk is valid as long as we remain
+   * inside the nghttp2_session_mem_recv2() call that consumes it.
+   *
+   * on_downstream_body() checks whether the data span it receives points
+   * into this chunk and, if so, steals it directly into response_buf_
+   * (zero-copy).  After nghttp2_session_mem_recv2() returns the chunk is
+   * either already owned by a response_buf_ or recycled back to the pool.
+   */
+  Memchunk16K *pending_rx_chunk_;
 };
 
 nghttp2_session_callbacks *create_http2_downstream_callbacks();

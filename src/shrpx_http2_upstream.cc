@@ -36,7 +36,9 @@
 #include "shrpx_http.h"
 #include "shrpx_worker.h"
 #include "shrpx_http2_session.h"
+#include "shrpx_http2_downstream_connection.h"
 #include "shrpx_log.h"
+#include "shrpx_zcopy_stats.h"
 #ifdef HAVE_MRUBY
 #  include "shrpx_mruby.h"
 #endif // defined(HAVE_MRUBY)
@@ -50,6 +52,16 @@ using namespace nghttp2;
 
 namespace shrpx {
 
+// MAX_BUFFER_SIZE is the pacing limit for the on_write loop: nghttp2 stops
+// producing new frames when wb_ >= MAX_BUFFER_SIZE.  It is also the hard PAUSE
+// threshold in downstream_data_read_callback (only triggered when buffer is
+// already at capacity, not based on the remaining headroom before adding a frame).
+// Previously this constant also capped DATA frame size via:
+//   nread = min(nread, MAX_BUFFER_SIZE - 9 - wb_->rleft())
+// That cap is removed (see downstream_data_read_callback) because with
+// NGHTTP2_DATA_FLAG_NO_COPY the payload enters wb_ in send_data_callback, not
+// in read_callback.  The old calculation double-counted wb_ occupancy and
+// shrunk frames to ~8 KB under heavy concurrency (400 streams → avg_length 8260).
 constexpr size_t MAX_BUFFER_SIZE = 32_k;
 
 namespace {
@@ -808,7 +820,55 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
     wb->append(static_cast<char>(padlen));
   }
 
+#ifdef SHRPX_ZC_BODY
+  // [SHRPX_ZC_BODY] Zero-copy send path (Copy #3 elimination):
+  // remove_zc splices full 16 KB Memchunks from body into wb by pointer
+  // manipulation (zero bytes copied per full chunk).  Only the final partial
+  // chunk is byte-copied.  Both body and wb are DefaultMemchunks from the
+  // same worker pool, satisfying the pool-same-owner precondition.
+  {
+    // Diagnostic: record call-site shape before the splice.
+    auto &zs = zcopy_stats();
+    auto head_mlen   = body->head ? body->head->len() : 0u;
+    auto body_rleft  = body->rleft();
+    // Query the actual remote stream window nghttp2 sees right now.
+    // If avg_remote_win ≈ avg_length → window is the binding constraint.
+    // If avg_remote_win ≫ avg_length → something inside nghttpx caps frame size.
+    auto rwin = nghttp2_session_get_stream_remote_window_size(
+        session, frame->hd.stream_id);
+    zs.send_cb_count.fetch_add(1, std::memory_order_relaxed);
+    zs.send_cb_length_total.fetch_add(length, std::memory_order_relaxed);
+    zs.send_cb_head_mlen_total.fetch_add(head_mlen, std::memory_order_relaxed);
+    if (rwin > 0) {
+      zs.send_cb_remote_win_total.fetch_add(static_cast<uint64_t>(rwin),
+                                            std::memory_order_relaxed);
+    }
+    // body_drained: length consumed all (or more than) what body currently holds,
+    // meaning body—not flow control—was the binding constraint on frame size.
+    if (length >= body_rleft) {
+      zs.send_cb_body_drained.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    size_t tail_copied = 0;
+    auto moved = body->remove_zc(*wb, length, &tail_copied);
+    // spliced = zero-copy bytes (phase 1), tail_copied = memcpy bytes (phase 2)
+    auto spliced = moved - tail_copied;
+    if (spliced > 0) {
+      zs.send_spliced_bytes.fetch_add(spliced, std::memory_order_relaxed);
+    }
+    if (tail_copied > 0) {
+      zs.send_tail_bytes.fetch_add(tail_copied, std::memory_order_relaxed);
+    }
+    if (spliced == 0) {
+      zs.send_cb_zero_splice.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (tail_copied == 0) {
+      zs.send_cb_full_splice.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+#else
   body->remove(*wb, length);
+#endif
 
   wb->append(PADDING.data(), padlen);
 
@@ -1419,15 +1479,26 @@ nghttp2_ssize downstream_data_read_callback(nghttp2_session *session,
 
   auto buffer = upstream->get_response_buf();
 
-  if (max_buffer_size <
-      std::min(nread, static_cast<size_t>(256)) + 9 + buffer->rleft()) {
+  // With NGHTTP2_DATA_FLAG_NO_COPY the frame payload is NOT copied into wb_
+  // here — it only enters wb_ later inside send_data_callback.  Capping nread
+  // by (max_buffer_size - 9 - buffer->rleft()) at this point double-counts the
+  // buffer occupancy: it measures wb_ BEFORE our frame lands, then under-sizes
+  // nread to "fit", yielding avg_length ≈ 8260 even when flow-control windows
+  // are 1 GB.  The on_write loop guard (wb_.rleft() >= max_buffer_size → return)
+  // already provides pacing for this connection.  We only need to PAUSE here
+  // when the buffer is already at or over the hard limit, preventing run-away
+  // queuing in extreme backpressure scenarios.
+  if (buffer->rleft() >= max_buffer_size) {
     if (log_enabled(INFO)) {
-      Log{INFO, upstream} << "Buffer is almost full.  Skip write DATA";
+      Log{INFO, upstream} << "Buffer is full.  Skip write DATA";
     }
     return NGHTTP2_ERR_PAUSE;
   }
 
-  nread = std::min(nread, max_buffer_size - 9 - buffer->rleft());
+  // nread is bounded only by body->rleft() and the nghttp2 flow-control cap
+  // (length = min(stream_window, connection_window, MAX_FRAME_SIZE) = 16384).
+  // This lets send_data_callback see full-frame lengths, enabling remove_zc to
+  // splice whole 16 KB Memchunks rather than partial fragments.
 
   auto body_empty = body->rleft() == nread;
 
@@ -1896,7 +1967,37 @@ std::expected<void, Error>
 Http2Upstream::on_downstream_body(Downstream *downstream,
                                   std::span<const uint8_t> data, bool flush) {
   auto body = downstream->get_response_buf();
+
+#ifdef SHRPX_ZC_BODY
+  /*
+   * [SHRPX_ZC_BODY] Zero-copy fast path: if the data span points into the
+   * Http2Session's current pending_rx_chunk_, steal that chunk directly into
+   * response_buf_, eliminating Copy #5.
+   *
+   * Falls through to body->append() if the steal is not possible (e.g.
+   * headers-only read, non-H2 downstream connection, or pointer mismatch).
+   */
+  bool stolen = false;
+  if (auto *dconn =
+        dynamic_cast<Http2DownstreamConnection *>(
+          downstream->get_downstream_connection())) {
+    if (auto *http2session = dconn->get_http2session()) {
+      if (auto *chunk = http2session->try_claim_rx_chunk(data.data())) {
+        body->steal_chunk(chunk,
+                          const_cast<uint8_t *>(data.data()),
+                          const_cast<uint8_t *>(data.data()) + data.size());
+        stolen = true;
+        zcopy_stats().body_steal_hit.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+  if (!stolen) {
+    body->append(data);
+    zcopy_stats().body_steal_miss.fetch_add(1, std::memory_order_relaxed);
+  }
+#else
   body->append(data);
+#endif
 
   if (flush) {
     nghttp2_session_resume_data(

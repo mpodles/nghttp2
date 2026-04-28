@@ -84,6 +84,8 @@ public:
   submit_rst_stream(Downstream *downstream,
                     uint32_t error_code = NGHTTP2_INTERNAL_ERROR);
 
+  Http2Session *get_http2session() const { return http2session_; }
+
   Http2DownstreamConnection *dlnext, *dlprev;
 
 private:
