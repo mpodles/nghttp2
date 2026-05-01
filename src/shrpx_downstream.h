@@ -34,6 +34,7 @@
 #include <chrono>
 #include <algorithm>
 #include <expected>
+#include <deque>
 
 #include <ev.h>
 
@@ -46,6 +47,22 @@
 #include "llhttp.h"
 
 #include "shrpx_io_control.h"
+
+// Forward declarations for XLIO zero-copy integration.
+struct xlio_buf_opaque;
+
+namespace shrpx {
+
+// One contiguous chunk of response body backed by an XLIO DMA buffer.
+// Created in on_downstream_body() when the incoming data is a zero-copy
+// RX segment; consumed in send_data_callback() for zero-copy TX.
+struct ZcBodyRef {
+  const uint8_t   *data; // pointer into the DMA buffer
+  std::size_t      len;  // payload length
+  xlio_buf_opaque *buf;  // XLIO buffer handle (ownership transfers to ZcRxOwner on TX)
+};
+
+} // namespace shrpx
 #include "shrpx_log_config.h"
 #include "http2.h"
 #include "memchunk.h"
@@ -428,6 +445,24 @@ public:
   DownstreamState get_response_state() const;
   DefaultMemchunks *get_response_buf();
   bool response_buf_full();
+
+  // [XLIO-ZC] Push a zero-copy body segment received from the backend.
+  // Caller transfers xlio_buf ownership; it will be freed on TX ACK via ZcRxOwner.
+  void push_zc_body(const uint8_t *data, std::size_t len, xlio_buf_opaque *buf) {
+    zc_body_queue_.push_back({data, len, buf});
+    zc_body_rleft_ += len;
+  }
+  // Consume up to |n| bytes from zc_body_queue_, advancing pointers.
+  // Returns the ZcBodyRef for the consumed slice (with buf=nullptr if split).
+  // For now callers are expected to consume exactly one whole ref at a time.
+  ZcBodyRef pop_zc_body() {
+    auto ref = zc_body_queue_.front();
+    zc_body_queue_.pop_front();
+    zc_body_rleft_ -= ref.len;
+    return ref;
+  }
+  std::size_t get_zc_body_rleft() const { return zc_body_rleft_; }
+  bool zc_body_empty() const { return zc_body_queue_.empty(); }
   // Validates that received response body length and content-length
   // matches.
   bool validate_response_recv_body_length() const;
@@ -562,6 +597,10 @@ private:
   DefaultMemchunks blocked_request_buf_;
   DefaultMemchunks request_buf_;
   DefaultMemchunks response_buf_;
+  // [XLIO-ZC] Zero-copy body segments waiting to be sent to the client.
+  // Populated by on_downstream_body() via try_claim_zc_buf().
+  std::deque<ZcBodyRef> zc_body_queue_;
+  std::size_t           zc_body_rleft_{0};
 
   // The Sec-WebSocket-Key field sent to the peer.  This field is used
   // if frontend uses RFC 8441 WebSocket bootstrapping via HTTP/2.

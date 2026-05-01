@@ -52,6 +52,7 @@
 #include "shrpx_error.h"
 #include "memchunk.h"
 #include "errors.h"
+#include "shrpx_xlio.h"
 
 namespace shrpx {
 
@@ -174,6 +175,17 @@ struct Connection {
   struct ev_loop *loop;
   void *data;
   int fd;
+  /*
+   * Ultra API socket handle.  Non-zero after tls_handshake() completes on
+   * an XLIO-managed connection (set via XlioAdapter::socket_from_fd).
+   *
+   * Used for Ultra TX experiments.  For TLS-encrypted connections this
+   * handle is valid but xlio_socket_sendv bypasses TLS record framing —
+   * use write_tls (SSL_write) for encrypted sends.  For cleartext (h2c)
+   * connections write_clear uses xlio_socket_sendv(INLINE) when this is
+   * non-zero.
+   */
+  shrpx_xlio_socket_t xlio_sock;
   size_t tls_dyn_rec_warmup_threshold;
   std::chrono::steady_clock::duration tls_dyn_rec_idle_timeout;
   // Application protocol used over the connection.  This field is not

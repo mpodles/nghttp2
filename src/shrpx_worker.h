@@ -55,6 +55,7 @@
 #include "shrpx_downstream_connection_pool.h"
 #include "memchunk.h"
 #include "shrpx_tls.h"
+#include "shrpx_xlio.h"
 #include "shrpx_live_check.h"
 #include "shrpx_connect_blocker.h"
 #include "shrpx_dns_tracker.h"
@@ -400,6 +401,12 @@ public:
   int handle_connection(int fd, const sockaddr *addr, socklen_t addrlen,
                         const UpstreamAddr *faddr);
 
+  /**
+   * Returns the XLIO poll-group for this worker, or 0 if XLIO is absent.
+   * Created once at worker startup; valid for the lifetime of the worker.
+   */
+  shrpx_xlio_poll_group_t get_xlio_poll_group() const { return xlio_group_; }
+
 private:
 #ifndef NOTHREADS
   std::future<void> fut_;
@@ -457,6 +464,12 @@ private:
   std::unique_ptr<ConnectBlocker> connect_blocker_;
 
   bool graceful_shutdown_;
+
+  /* XLIO Ultra API poll-group.  0 if XLIO is absent or creation failed. */
+  shrpx_xlio_poll_group_t xlio_group_;
+  /* ev_prepare watcher that calls xlio_poll_group_poll() before each
+   * epoll_wait.  Active only when xlio_group_ != 0. */
+  ev_prepare xlio_prepare_watcher_;
 };
 
 // Selects group based on request's |hostport| and |path|.  |hostport|

@@ -236,6 +236,35 @@ std::expected<void, Error> ClientHandler::tls_handshake() {
     return rv;
   }
 
+  /*
+   * Attempt to obtain an XLIO Ultra API handle for this frontend
+   * connection.  This succeeds only when XLIO is loaded and the fd is
+   * managed by XLIO (i.e. the socket was offloaded to the NIC).
+   *
+   * The handle is stored in conn_.xlio_sock and is used by:
+   *   - write_clear: replaced with xlio_socket_sendv(INLINE) for h2c.
+   *   - Future: zerocopy TX for DATA frame bodies once the TLS-aware
+   *     express-send path is added to sockinfo_tcp_ops_tls.
+   *
+   * NOTE: For TLS connections (this path), conn_.xlio_sock is set but
+   * write_tls still uses SSL_write.  The handle is available for future
+   * use — do NOT call xlio_socket_sendv(INLINE) here because it bypasses
+   * the TLS record framing done by sockinfo_tcp_ops_tls::tcp_tx.
+   */
+  auto &xa = XlioAdapter::get();
+  if (xa.has_ultra_tx()) {
+    conn_.xlio_sock = xa.socket_from_fd(conn_.fd);
+    if (log_enabled(INFO)) {
+      if (conn_.xlio_sock) {
+        Log{INFO, this} << "XLIO Ultra API handle acquired (sock="
+                        << conn_.xlio_sock << ")";
+      } else {
+        Log{INFO, this} << "XLIO Ultra API not available for this fd "
+                           "(not an XLIO-managed socket)";
+      }
+    }
+  }
+
   read_ = &ClientHandler::read_tls;
   write_ = &ClientHandler::write_tls;
 
@@ -540,6 +569,23 @@ void ClientHandler::setup_upstream_io_callback() {
     write_ = &ClientHandler::write_clear;
     on_read_ = &ClientHandler::upstream_http1_connhd_read;
     on_write_ = &ClientHandler::upstream_noop;
+
+    // For cleartext connections there is no TLS handshake, so acquire
+    // the XLIO Ultra API handle here.  write_clear will use
+    // xlio_socket_sendv(INLINE) whenever xlio_sock is non-zero.
+    auto &xa = XlioAdapter::get();
+    if (xa.has_ultra_tx()) {
+      conn_.xlio_sock = xa.socket_from_fd(conn_.fd);
+      if (log_enabled(INFO)) {
+        if (conn_.xlio_sock) {
+          Log{INFO, this} << "XLIO Ultra API handle acquired for cleartext (sock="
+                          << conn_.xlio_sock << ")";
+        } else {
+          Log{INFO, this} << "XLIO Ultra API not available for this fd "
+                             "(not an XLIO-managed socket)";
+        }
+      }
+    }
   }
 }
 

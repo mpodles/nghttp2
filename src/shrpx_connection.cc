@@ -68,6 +68,7 @@ Connection::Connection(struct ev_loop *loop, int fd, SSL *ssl,
     loop(loop),
     data(data),
     fd(fd),
+    xlio_sock(0),
     tls_dyn_rec_warmup_threshold(tls_dyn_rec_warmup_threshold),
     tls_dyn_rec_idle_timeout(util::duration_from(tls_dyn_rec_idle_timeout)),
     proto(proto),
@@ -500,6 +501,47 @@ Connection::write_tls(std::span<const uint8_t> data) {
 
   tls.last_write_idle = std::chrono::steady_clock::time_point(-1s);
 
+  /*
+   * Ultra API TLS TX path (Level 1 experiment).
+   *
+   * When an XLIO Ultra socket handle is available AND the TLS handshake is
+   * complete, route the write through xlio_socket_sendv() instead of
+   * SSL_write().  The modified xlio_socket_sendv (sock-extra.cpp) detects
+   * UTLS_TX via dynamic_cast<sockinfo_tcp_ops_tls*> and redirects through
+   * si->tx() → sockinfo_tcp_ops_tls::tx() → TLS record framing →
+   * tcp_tx_express() → NIC AEAD encryption.  No SSL_write overhead.
+   *
+   * Success criterion: client receives a valid, decrypted HTTP/2 response.
+   * An "[xlio-ultra] UTLS_TX active → routing through TLS ops" line on
+   * stderr from XLIO confirms Level 1 is exercised.
+   *
+   * If this path is not desired, removing xlio_sock from tls_handshake()
+   * falls back to SSL_write permanently.
+   */
+  if (xlio_sock && SSL_is_init_finished(tls.ssl)) {
+    const struct iovec iov = {
+        .iov_base = const_cast<uint8_t *>(data.data()),
+        .iov_len  = data.size(),
+    };
+    auto &xa = XlioAdapter::get();
+    int rc = xa.sendv_inline(xlio_sock, &iov, 1, /*flush=*/true);
+    if (rc < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOMEM) {
+        tls.last_writelen = data.size();
+        wlimit.startw();
+        ev_timer_again(loop, &wt);
+        return 0;
+      }
+      return std::unexpected{Error::NETWORK};
+    }
+    wlimit.drain(data.size());
+    if (ev_is_active(&wt)) {
+      ev_timer_again(loop, &wt);
+    }
+    update_tls_warmup_writelen(data.size());
+    return data.size();
+  }
+
   ERR_clear_error();
 
 #ifdef NGHTTP2_GENUINE_OPENSSL
@@ -720,6 +762,30 @@ Connection::write_clear(std::span<const uint8_t> data) {
     return 0;
   }
 
+  if (xlio_sock) {
+    /* Ultra API path: INLINE copies data into XLIO internal buffers.
+     * All bytes are consumed on success (no partial writes). */
+    const struct iovec iov = {
+        .iov_base = const_cast<uint8_t *>(data.data()),
+        .iov_len  = data.size(),
+    };
+    auto &xa = XlioAdapter::get();
+    int rc = xa.sendv_inline(xlio_sock, &iov, 1, /*flush=*/true);
+    if (rc < 0) {
+      if (errno == ENOMEM || errno == EAGAIN || errno == EWOULDBLOCK) {
+        wlimit.startw();
+        ev_timer_again(loop, &wt);
+        return 0;
+      }
+      return std::unexpected{Error::NETWORK};
+    }
+    wlimit.drain(data.size());
+    if (ev_is_active(&wt)) {
+      ev_timer_again(loop, &wt);
+    }
+    return data.size();
+  }
+
   ssize_t nwrite;
   while ((nwrite = write(fd, data.data(), data.size())) == -1 && errno == EINTR)
     ;
@@ -746,6 +812,28 @@ Connection::writev_clear(std::span<struct iovec> iov) {
   iov = limit_iovec(iov, wlimit.avail());
   if (iov.empty()) {
     return 0;
+  }
+
+  if (xlio_sock) {
+    /* Ultra API path: scatter-gather INLINE send.  Counts total bytes. */
+    size_t total = 0;
+    for (const auto &v : iov) total += v.iov_len;
+    auto &xa = XlioAdapter::get();
+    int rc = xa.sendv_inline(xlio_sock, iov.data(),
+                             static_cast<unsigned>(iov.size()), /*flush=*/true);
+    if (rc < 0) {
+      if (errno == ENOMEM || errno == EAGAIN || errno == EWOULDBLOCK) {
+        wlimit.startw();
+        ev_timer_again(loop, &wt);
+        return 0;
+      }
+      return std::unexpected{Error::NETWORK};
+    }
+    wlimit.drain(total);
+    if (ev_is_active(&wt)) {
+      ev_timer_again(loop, &wt);
+    }
+    return total;
   }
 
   ssize_t nwrite;

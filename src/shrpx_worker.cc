@@ -206,7 +206,8 @@ Worker::Worker(struct ev_loop *loop, SSL_CTX *sv_ssl_ctx, SSL_CTX *cl_ssl_ctx,
     ticket_keys_(ticket_keys),
     connect_blocker_(
       std::make_unique<ConnectBlocker>(randgen_, loop_, nullptr, nullptr)),
-    graceful_shutdown_(false) {
+    graceful_shutdown_(false),
+    xlio_group_(0) {
   ev_async_init(&w_, eventcb);
   w_.data = this;
   ev_async_start(loop_, &w_);
@@ -219,6 +220,41 @@ Worker::Worker(struct ev_loop *loop, SSL_CTX *sv_ssl_ctx, SSL_CTX *cl_ssl_ctx,
 
   ev_timer_init(&disable_listener_timer_, disable_listener_cb, 0., 0.);
   disable_listener_timer_.data = this;
+
+  /* Set up the XLIO Ultra API poll group if XLIO is present. */
+  {
+    shrpx_xlio_poll_group_attr attr{};
+    /*
+     * socket_event_cb is required by XLIO even if we don't need events yet.
+     * A no-op lambda with the right signature.
+     */
+    attr.socket_event_cb = [](shrpx_xlio_socket_t, std::uintptr_t,
+                               int, int) {};
+    if (XlioAdapter::get().poll_group_create(&attr, &xlio_group_) != 0) {
+      xlio_group_ = 0;
+    }
+  }
+
+  if (xlio_group_) {
+    /*
+     * Register an ev_prepare watcher that calls xlio_poll_group_poll()
+     * immediately before each epoll_wait().  This drains XLIO completions
+     * and RX events without requiring a dedicated spin thread.  For full
+     * zero-latency we would use a spin loop (see design doc), but for the
+     * initial TX experiment this is sufficient.
+     */
+    ev_prepare_init(&xlio_prepare_watcher_, [](struct ev_loop *, ev_prepare *w,
+                                               int) {
+      auto self = static_cast<Worker *>(w->data);
+      XlioAdapter::get().poll_group_poll(self->get_xlio_poll_group());
+    });
+    xlio_prepare_watcher_.data = this;
+    ev_prepare_start(loop_, &xlio_prepare_watcher_);
+
+    if (log_enabled(INFO)) {
+      Log{INFO, this} << "XLIO Ultra API poll group created";
+    }
+  }
 
   replace_downstream_config(std::move(downstreamconf));
 }
@@ -462,6 +498,12 @@ Worker::~Worker() {
   ev_timer_stop(loop_, &mcpool_clear_timer_);
   ev_timer_stop(loop_, &proc_wev_timer_);
   ev_timer_stop(loop_, &disable_listener_timer_);
+
+  if (xlio_group_) {
+    ev_prepare_stop(loop_, &xlio_prepare_watcher_);
+    XlioAdapter::get().poll_group_destroy(xlio_group_);
+    xlio_group_ = 0;
+  }
 }
 
 void Worker::schedule_clear_mcpool() {

@@ -54,6 +54,11 @@
 
 using namespace nghttp2;
 
+// Forward declaration for XLIO zero-copy receive buffer handle.
+struct xlio_buf_opaque;
+// Forward declaration for the ZC segment descriptor from shrpx_xlio.h.
+struct shrpx_xlio_zc_seg;
+
 namespace shrpx {
 
 class Http2DownstreamConnection;
@@ -268,6 +273,19 @@ public:
 
   bool get_allow_connect_proto() const;
 
+  // [XLIO-ZC] If |data| points into the current pending_zc_seg_ (a DMA buffer
+  // segment from xlio_recv_zc_fd), return the xlio_buf handle and clear the
+  // pending pointer.  The caller now owns the buf and must NOT call release_zc.
+  // Returns nullptr if no pending ZC seg or pointer is out of range.
+  xlio_buf_opaque *try_claim_zc_buf(const uint8_t *data) {
+    if (!pending_zc_seg_) return nullptr;
+    const auto *base = static_cast<const uint8_t *>(pending_zc_seg_->data);
+    if (data < base || data >= base + pending_zc_seg_->len) return nullptr;
+    auto *buf      = pending_zc_seg_->buf;
+    pending_zc_seg_ = nullptr;
+    return buf;
+  }
+
   // If |data| points into the current pending_rx_chunk_, return and
   // relinquish that chunk (caller takes ownership).  Otherwise return
   // nullptr.  Used by Http2Upstream::on_downstream_body to avoid a copy.
@@ -336,6 +354,8 @@ private:
    * When set, read_ is pointed at read_tls_zcopy() instead of read_tls().
    */
   bool xlio_zcopy_rx_;
+  // Set after the first INFO log in read_tls_zcopy() to avoid log spam.
+  bool xlio_zc_first_seg_logged_;
 
   /*
    * Pool chunk used as the SSL_read destination in the current read_tls()
@@ -348,6 +368,16 @@ private:
    * either already owned by a response_buf_ or recycled back to the pool.
    */
   Memchunk16K *pending_rx_chunk_;
+
+  /*
+   * [XLIO-ZC] Non-null during a read_tls_zcopy() segment processing cycle.
+   * Points to the current xlio ZC segment (DMA buffer + length).
+   * try_claim_zc_buf() claims it when on_downstream_body() sees data that
+   * lives in this segment.  After on_read() returns the pointer is either
+   * nullptr (claimed, ownership transferred to Downstream::zc_body_queue_)
+   * or still set (not claimed → release_zc must be called).
+   */
+  const shrpx_xlio_zc_seg *pending_zc_seg_;
 };
 
 nghttp2_session_callbacks *create_http2_downstream_callbacks();

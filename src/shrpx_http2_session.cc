@@ -203,7 +203,9 @@ Http2Session::Http2Session(struct ev_loop *loop, SSL_CTX *ssl_ctx,
     settings_recved_(false),
     allow_connect_proto_(false),
     xlio_zcopy_rx_(false),
-    pending_rx_chunk_(nullptr) {
+    xlio_zc_first_seg_logged_(false),
+    pending_rx_chunk_(nullptr),
+    pending_zc_seg_(nullptr) {
   read_ = write_ = &Http2Session::noop;
 
   on_read_ = &Http2Session::read_noop;
@@ -2070,24 +2072,24 @@ std::expected<void, Error> Http2Session::tls_handshake() {
    * After a successful TLS handshake, check whether XLIO's zero-copy
    * receive extension is available for this connection.
    *
-   * We detect UTLS_RX by trying xlio_recv_zc_fd() on the just-connected
-   * socket with max_segs=0 as a capability probe.  ENOTSUP means the fd is
-   * not an XLIO-managed UTLS_RX socket; any other result (including EAGAIN,
-   * meaning "no data yet but the socket is the right type") confirms support.
+   * We optimistically enable read_tls_zcopy() whenever xlio_recv_zc_fd is
+   * present at runtime (has_recv_zc() == true).  read_tls_zcopy() itself
+   * handles the ENOTSUP fallback: if the socket is not a UTLS_RX socket the
+   * first recv_zc call returns ENOTSUP, the flag is cleared, and read_tls()
+   * takes over permanently for this session.
    *
-   * If supported, we use read_tls_zcopy() as the read handler.  It
-   * automatically falls back to read_tls() for non-application TLS records.
+   * NOTE: the previous probe used max_segs=0 which always returned EINVAL
+   * from recv_zc_impl (max_segs <= 0 guard), so xlio_zcopy_rx_ was never
+   * set.  A dedicated xlio_is_utls_rx(fd) query would be cleaner; for now
+   * we rely on read_tls_zcopy's ENOTSUP handler as the detection mechanism.
    */
   {
     auto &xa = XlioAdapter::get();
-    if (xa.has_recv_zc()) {
-      shrpx_xlio_zc_seg probe;
-      int rc = xa.recv_zc(conn_.fd, &probe, 0);
-      /*
-       * rc == -1, errno == EAGAIN → right socket type, no data yet.
-       * rc == -1, errno == ENOTSUP → not a UTLS-RX socket, keep normal path.
-       */
-      xlio_zcopy_rx_ = (rc >= 0 || errno == EAGAIN);
+    xlio_zcopy_rx_ = xa.has_recv_zc();
+    if (log_enabled(INFO)) {
+      Log{INFO, this} << "XLIO zero-copy RX: "
+                      << (xlio_zcopy_rx_ ? "enabled (read_tls_zcopy active)"
+                                         : "disabled (xlio_recv_zc_fd not found)");
     }
   }
 
@@ -2198,10 +2200,14 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
 
       case ENOTSUP:
         /*
-         * This connection is no longer eligible for zero-copy (shouldn't
-         * normally happen post-handshake, but be defensive).  Revert to the
-         * normal TLS read path permanently for this session.
+         * Socket is not a UTLS_RX socket — recv_zc_impl returned ENOTSUP
+         * because tls_type==0 (ciphertext, no kTLS offload on this fd).
+         * Revert to normal TLS read path permanently for this session.
          */
+        if (log_enabled(INFO)) {
+          Log{INFO, this} << "read_tls_zcopy: ENOTSUP — not a UTLS_RX socket, "
+                             "falling back to SSL_read permanently";
+        }
         xlio_zcopy_rx_ = false;
         read_ = &Http2Session::read_tls;
         return read_tls();
@@ -2228,13 +2234,50 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
     zcopy_stats().recv_zc_segs.fetch_add(static_cast<uint64_t>(nseg),
                                          std::memory_order_relaxed);
 
+    /* One-shot INFO log: first time we actually deliver data zero-copy. */
+    if (log_enabled(INFO) && !xlio_zc_first_seg_logged_) {
+      xlio_zc_first_seg_logged_ = true;
+      size_t total_len = 0;
+      for (int k = 0; k < nseg; ++k) total_len += segs[k].len;
+      Log{INFO, this} << "read_tls_zcopy: first ZC delivery nseg=" << nseg
+                      << " total_bytes=" << total_len
+                      << " tls_type=" << static_cast<unsigned>(segs[0].tls_type)
+                      << " (expect 23=0x17 for UTLS_RX application data)";
+    }
+
+    /*
+     * [XLIO-ZC] Feed each segment into the nghttp2 parser.
+     *
+     * Before calling on_read(), expose the segment to try_claim_zc_buf()
+     * via pending_zc_seg_.  If on_downstream_body() fires for a DATA frame
+     * whose payload lives in this DMA buffer, it will call try_claim_zc_buf(),
+     * claim the xlio_buf handle, and push a ZcBodyRef onto the Downstream's
+     * zc_body_queue_.  In that case we skip release_zc() — ownership passes
+     * through ZcBodyRef → ZcRxOwner → freed on TCP ACK.
+     *
+     * If the segment contains only non-DATA frames (HEADERS, SETTINGS, etc.)
+     * the buf is not claimed and we release it normally after on_read().
+     */
     for (int i = 0; i < nseg; ++i) {
       auto data = std::span{static_cast<const uint8_t *>(segs[i].data),
                             segs[i].len};
-      auto rv = on_read(data);
 
-      /* Release the DMA buffer regardless of parse outcome. */
-      xa.release_zc(segs[i].buf);
+      pending_zc_seg_ = &segs[i]; // expose to try_claim_zc_buf()
+      auto rv = on_read(data);
+      bool claimed = (pending_zc_seg_ == nullptr); // cleared if DATA body claimed
+      pending_zc_seg_ = nullptr; // always reset
+
+      if (log_enabled(INFO) && claimed) {
+        Log{INFO, this} << "[XLIO-ZC] ZC buf claimed for DATA body:"
+                        << " seg=" << i << " len=" << segs[i].len
+                        << " buf=" << static_cast<void *>(segs[i].buf)
+                        << " (release_zc skipped, freed on TX ACK)";
+      }
+
+      if (!claimed) {
+        xa.release_zc(segs[i].buf);
+      }
+      /* If claimed: buf lifetime is managed by ZcRxOwner → freed on TCP ACK */
 
       if (!rv) {
         /* Release remaining buffers before propagating the error. */

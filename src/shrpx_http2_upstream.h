@@ -103,6 +103,12 @@ public:
   void response_drain(size_t n) override;
   bool response_empty() const override;
 
+  // [XLIO-ZC] Flush all pending data in wb_ to the client TLS socket now.
+  // Called from send_data_callback() before a zero-copy DATA body send, so
+  // that HEADERS (already in wb_) are transmitted before the ZC payload.
+  // Returns true if wb_ was fully drained, false on EAGAIN or error.
+  bool flush_response_buf();
+
   Downstream *on_downstream_push_promise(Downstream *downstream,
                                          int32_t promised_stream_id) override;
   std::expected<void, Error>

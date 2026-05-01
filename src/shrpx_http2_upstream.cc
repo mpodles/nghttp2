@@ -39,6 +39,7 @@
 #include "shrpx_http2_downstream_connection.h"
 #include "shrpx_log.h"
 #include "shrpx_zcopy_stats.h"
+#include "shrpx_xlio.h"
 #ifdef HAVE_MRUBY
 #  include "shrpx_mruby.h"
 #endif // defined(HAVE_MRUBY)
@@ -814,6 +815,82 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
 
   size_t padlen = 0;
 
+  // [XLIO-ZC] Hardware zero-copy DATA frame send path.
+  //
+  // Conditions: ZC body is queued, no padding (simplifies accounting), and
+  // the client has an XLIO Ultra socket.
+  //
+  // Strategy (preserves HTTP/2 byte-stream order):
+  //   1. flush_response_buf() — send all preceding frames (HEADERS, SETTINGS)
+  //      from wb_ to the TLS socket NOW, before touching the DATA frame.
+  //   2. sendv_inline(header, MSG_MORE) — send 9-byte DATA frame header
+  //      directly via XLIO, deferring flush until step 3.
+  //   3. sendv_zc(payload, flush) — send ZC payload; NIC reads from DMA and
+  //      re-encrypts.  ZcRxOwner::put() fires on TCP ACK to free the buffer.
+  //
+  // wb_ is completely bypassed for the DATA frame itself (no copy).
+  if (!downstream->zc_body_empty() && frame->data.padlen == 0) {
+    auto &xa    = XlioAdapter::get();
+    auto  csock = upstream->get_client_handler()->get_connection()->xlio_sock;
+    if (csock && xa.has_ultra_tx()) {
+
+      // 1. Flush wb_ (HEADERS frames) to the TLS socket BEFORE the DATA frame.
+      if (!upstream->flush_response_buf()) {
+        Log{INFO, upstream}
+            << "[XLIO-ZC] send_data_callback: flush_response_buf EAGAIN/err"
+               " — aborting ZC for this frame (connection will close)";
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+      }
+
+      // 2. Send the 9-byte HTTP/2 DATA frame header inline (MSG_MORE: not
+      //    flushed yet, waits for the ZC payload to form the same TCP segment).
+      {
+        struct iovec hdr_iov{const_cast<uint8_t *>(framehd), 9};
+        int hrc = xa.sendv_inline(csock, &hdr_iov, 1, /*flush=*/false);
+        if (hrc < 0) {
+          Log{INFO, upstream}
+              << "[XLIO-ZC] send_data_callback: header sendv_inline failed rc="
+              << hrc;
+          return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+      }
+
+      // 3. Send ZC payload — NIC reads from DMA buffer, TLS encrypts.
+      //    buf ownership transfers to ZcRxOwner; freed on TCP ACK.
+      auto ref = downstream->pop_zc_body();
+      struct iovec iov{const_cast<uint8_t *>(ref.data), ref.len};
+      int rc = xa.sendv_zc(csock, &iov, 1, ref.buf, /*flush=*/true);
+
+      if (log_enabled(INFO)) {
+        Log{INFO, upstream}
+            << "[XLIO-ZC] ZC DATA frame sent:"
+            << " stream=" << frame->hd.stream_id
+            << " len=" << ref.len
+            << " mkey=" << xa.buf_get_mkey(ref.buf)
+            << " rc=" << rc
+            << (rc >= 0 ? " [buf → ZcRxOwner, freed on TCP ACK]"
+                        : " [sendv_zc FAILED — buf released by ZcRxOwner]");
+      }
+
+      if (rc < 0) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+      }
+
+      // Bookkeeping (same as copy path).
+      if (downstream->zc_body_empty() && body->rleft() == 0) {
+        downstream->disable_upstream_wtimer();
+      } else {
+        downstream->reset_upstream_wtimer();
+      }
+      if (length > 0 && !downstream->resume_read(SHRPX_NO_BUFFER, length)) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+      }
+      downstream->response_sent_body_length += length;
+      return 0;
+    }
+  }
+
+  // Copy path (ZC conditions not met or no XLIO socket).
   wb->append(framehd, 9);
   if (frame->data.padlen > 0) {
     padlen = frame->data.padlen - 1;
@@ -872,7 +949,7 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
 
   wb->append(PADDING.data(), padlen);
 
-  if (body->rleft() == 0) {
+  if (body->rleft() == 0 && downstream->zc_body_empty()) {
     downstream->disable_upstream_wtimer();
   } else {
     downstream->reset_upstream_wtimer();
@@ -1473,7 +1550,9 @@ nghttp2_ssize downstream_data_read_callback(nghttp2_session *session,
 
   const auto &resp = downstream->response();
 
-  auto nread = std::min(body->rleft(), length);
+  // [XLIO-ZC] Include hardware zero-copy body segments in the readable count.
+  auto total_rleft = body->rleft() + downstream->get_zc_body_rleft();
+  auto nread = std::min(total_rleft, length);
 
   auto max_buffer_size = upstream->get_max_buffer_size();
 
@@ -1500,7 +1579,7 @@ nghttp2_ssize downstream_data_read_callback(nghttp2_session *session,
   // This lets send_data_callback see full-frame lengths, enabling remove_zc to
   // splice whole 16 KB Memchunks rather than partial fragments.
 
-  auto body_empty = body->rleft() == nread;
+  auto body_empty = total_rleft == nread;
 
   *data_flags |= NGHTTP2_DATA_FLAG_NO_COPY;
 
@@ -1529,7 +1608,7 @@ nghttp2_ssize downstream_data_read_callback(nghttp2_session *session,
     }
   }
 
-  if (nread == 0 && ((*data_flags) & NGHTTP2_DATA_FLAG_EOF) == 0) {
+  if (total_rleft == 0 && ((*data_flags) & NGHTTP2_DATA_FLAG_EOF) == 0) {
     downstream->disable_upstream_wtimer();
     return NGHTTP2_ERR_DEFERRED;
   }
@@ -1968,36 +2047,61 @@ Http2Upstream::on_downstream_body(Downstream *downstream,
                                   std::span<const uint8_t> data, bool flush) {
   auto body = downstream->get_response_buf();
 
-#ifdef SHRPX_ZC_BODY
-  /*
-   * [SHRPX_ZC_BODY] Zero-copy fast path: if the data span points into the
-   * Http2Session's current pending_rx_chunk_, steal that chunk directly into
-   * response_buf_, eliminating Copy #5.
-   *
-   * Falls through to body->append() if the steal is not possible (e.g.
-   * headers-only read, non-H2 downstream connection, or pointer mismatch).
-   */
-  bool stolen = false;
-  if (auto *dconn =
-        dynamic_cast<Http2DownstreamConnection *>(
-          downstream->get_downstream_connection())) {
-    if (auto *http2session = dconn->get_http2session()) {
-      if (auto *chunk = http2session->try_claim_rx_chunk(data.data())) {
-        body->steal_chunk(chunk,
-                          const_cast<uint8_t *>(data.data()),
-                          const_cast<uint8_t *>(data.data()) + data.size());
-        stolen = true;
-        zcopy_stats().body_steal_hit.fetch_add(1, std::memory_order_relaxed);
+  // [XLIO-ZC] Hardware zero-copy path: if the data span is within the current
+  // pending ZC-RX DMA buffer, claim it and enqueue a ZcBodyRef instead of
+  // copying bytes.  send_data_callback() will send it via sendv_zc().
+  {
+    auto *dconn = dynamic_cast<Http2DownstreamConnection *>(
+        downstream->get_downstream_connection());
+    if (dconn) {
+      if (auto *http2session = dconn->get_http2session()) {
+        if (auto *buf = http2session->try_claim_zc_buf(data.data())) {
+          downstream->push_zc_body(data.data(), data.size(), buf);
+          if (log_enabled(INFO)) {
+            Log{INFO, this}
+                << "[XLIO-ZC] ZC body queued: len=" << data.size()
+                << " stream=" << downstream->get_stream_id()
+                << " buf=" << static_cast<void *>(buf)
+                << " total_zc_rleft=" << downstream->get_zc_body_rleft();
+          }
+          // Skip the copy path and fall through to resume / timer below.
+          goto body_queued;
+        }
       }
     }
   }
-  if (!stolen) {
-    body->append(data);
-    zcopy_stats().body_steal_miss.fetch_add(1, std::memory_order_relaxed);
+
+#ifdef SHRPX_ZC_BODY
+  /*
+   * [SHRPX_ZC_BODY] Software zero-copy fast path: if the data span points
+   * into the Http2Session's current pending_rx_chunk_, steal that chunk
+   * directly into response_buf_, eliminating Copy #5.
+   */
+  {
+    bool stolen = false;
+    if (auto *dconn =
+          dynamic_cast<Http2DownstreamConnection *>(
+            downstream->get_downstream_connection())) {
+      if (auto *http2session = dconn->get_http2session()) {
+        if (auto *chunk = http2session->try_claim_rx_chunk(data.data())) {
+          body->steal_chunk(chunk,
+                            const_cast<uint8_t *>(data.data()),
+                            const_cast<uint8_t *>(data.data()) + data.size());
+          stolen = true;
+          zcopy_stats().body_steal_hit.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+    if (!stolen) {
+      body->append(data);
+      zcopy_stats().body_steal_miss.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 #else
   body->append(data);
 #endif
+
+body_queued:
 
   if (flush) {
     nghttp2_session_resume_data(
@@ -2428,6 +2532,31 @@ std::span<const uint8_t> Http2Upstream::response_peek() const {
 void Http2Upstream::response_drain(size_t n) { wb_.drain(n); }
 
 bool Http2Upstream::response_empty() const { return wb_.rleft() == 0; }
+
+bool Http2Upstream::flush_response_buf() {
+  auto conn = handler_->get_connection();
+  while (wb_.rleft() > 0) {
+    auto data = wb_.peek();
+    if (data.empty()) break;
+    auto maybe_nwrite = conn->write_tls(data);
+    if (!maybe_nwrite) {
+      if (log_enabled(INFO)) {
+        Log{INFO, this} << "[XLIO-ZC] flush_response_buf: write_tls error";
+      }
+      return false;
+    }
+    auto nwrite = *maybe_nwrite;
+    if (nwrite == 0) {
+      if (log_enabled(INFO)) {
+        Log{INFO, this} << "[XLIO-ZC] flush_response_buf: EAGAIN ("
+                        << wb_.rleft() << " bytes remain)";
+      }
+      return false;
+    }
+    wb_.drain(nwrite);
+  }
+  return true;
+}
 
 DefaultMemchunks *Http2Upstream::get_response_buf() { return &wb_; }
 
