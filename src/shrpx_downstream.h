@@ -463,6 +463,11 @@ public:
   }
   std::size_t get_zc_body_rleft() const { return zc_body_rleft_; }
   bool zc_body_empty() const { return zc_body_queue_.empty(); }
+  // Length of just the front (oldest) ZC ref — used to size one DATA frame
+  // exactly so send_data_callback handles one atomic ZcBodyRef per call.
+  std::size_t get_zc_front_len() const {
+    return zc_body_queue_.empty() ? 0u : zc_body_queue_.front().len;
+  }
   // Validates that received response body length and content-length
   // matches.
   bool validate_response_recv_body_length() const;

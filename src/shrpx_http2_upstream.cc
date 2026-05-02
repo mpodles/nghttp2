@@ -858,6 +858,21 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
       // 3. Send ZC payload — NIC reads from DMA buffer, TLS encrypts.
       //    buf ownership transfers to ZcRxOwner; freed on TCP ACK.
       auto ref = downstream->pop_zc_body();
+
+      // Correctness check: length (from downstream_data_read_callback) must
+      // equal ref.len (the ZcBodyRef we're about to send).  A mismatch means
+      // the DATA frame header would claim N bytes but only M bytes follow on
+      // the wire, corrupting the HTTP/2 stream.
+      if (log_enabled(INFO)) {
+        Log{INFO, upstream}
+            << "[XLIO-ZC] send_data_cb pre-send:"
+            << " stream=" << frame->hd.stream_id
+            << " nghttp2_len=" << length
+            << " ref_len=" << ref.len
+            << " zc_rleft_after=" << downstream->get_zc_body_rleft()
+            << (length == ref.len ? " [MATCH ✓]" : " [MISMATCH ✗ — frame corrupted!]");
+      }
+
       struct iovec iov{const_cast<uint8_t *>(ref.data), ref.len};
       int rc = xa.sendv_zc(csock, &iov, 1, ref.buf, /*flush=*/true);
 
@@ -891,6 +906,13 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
   }
 
   // Copy path (ZC conditions not met or no XLIO socket).
+  if (log_enabled(INFO)) {
+    Log{INFO, upstream}
+        << "[XLIO-ZC] COPY DATA frame: stream=" << frame->hd.stream_id
+        << " len=" << length
+        << " body_rleft=" << body->rleft()
+        << " zc_queue=" << downstream->get_zc_body_rleft();
+  }
   wb->append(framehd, 9);
   if (frame->data.padlen > 0) {
     padlen = frame->data.padlen - 1;
@@ -1550,9 +1572,44 @@ nghttp2_ssize downstream_data_read_callback(nghttp2_session *session,
 
   const auto &resp = downstream->response();
 
-  // [XLIO-ZC] Include hardware zero-copy body segments in the readable count.
-  auto total_rleft = body->rleft() + downstream->get_zc_body_rleft();
-  auto nread = std::min(total_rleft, length);
+  // [XLIO-ZC] Report readable data for this DATA frame.
+  //
+  // IMPORTANT: when ZC body is queued, report only the FRONT entry's length,
+  // not the sum of all queued refs.  Each ZcBodyRef maps to exactly one
+  // send_data_callback invocation.  Returning total_rleft (e.g. 16330+54)
+  // would make nghttp2 create a 16384-byte DATA frame header but send_data_callback
+  // would only pop the first 16330-byte ref, producing a malformed frame.
+  //
+  // With this fix, nghttp2 creates one DATA frame per ZcBodyRef boundary:
+  //   frame1: header(len=16330) + 16330 ZC bytes  ← matches exactly
+  //   frame2: header(len=54)    + 54 ZC bytes     ← matches exactly
+  std::size_t avail;
+  if (!downstream->zc_body_empty()) {
+    // ZC path: one frame = one ZcBodyRef (the front one).
+    avail = downstream->get_zc_front_len();
+  } else {
+    // Copy path: all bytes in response_buf_.
+    avail = body->rleft();
+  }
+  auto total_rleft = body->rleft() + downstream->get_zc_body_rleft(); // for body_empty
+  auto nread = std::min(avail, length);
+
+  // [XLIO-ZC] Bookkeeping trace: log every invocation so we can see the frame
+  // sizing.  Format: [read_cb] tells nghttp2 to send nread bytes.
+  //   avail  = what we report (front ZcBodyRef or body->rleft())
+  //   total  = all data available (sum of all ZcBodyRefs + body)
+  //   queue  = number of ZcBodyRefs waiting
+  //   length = flow-control cap from nghttp2
+  if (log_enabled(INFO)) {
+    Log{INFO, upstream}
+        << "[XLIO-ZC] data_read_cb: stream=" << stream_id
+        << " avail=" << avail
+        << " total=" << total_rleft
+        << " nread=" << nread
+        << " zc_queue=" << downstream->get_zc_body_rleft()
+        << " body=" << body->rleft()
+        << " fc_cap=" << length;
+  }
 
   auto max_buffer_size = upstream->get_max_buffer_size();
 
@@ -1608,7 +1665,14 @@ nghttp2_ssize downstream_data_read_callback(nghttp2_session *session,
     }
   }
 
-  if (total_rleft == 0 && ((*data_flags) & NGHTTP2_DATA_FLAG_EOF) == 0) {
+  if (avail == 0 && ((*data_flags) & NGHTTP2_DATA_FLAG_EOF) == 0) {
+    if (log_enabled(INFO)) {
+      Log{INFO, upstream}
+          << "[XLIO-ZC] data_read_cb DEFERRED: stream=" << stream_id
+          << " body=" << body->rleft()
+          << " zc_queue=" << downstream->get_zc_body_rleft()
+          << " resp_state=" << (int)downstream->get_response_state();
+    }
     downstream->disable_upstream_wtimer();
     return NGHTTP2_ERR_DEFERRED;
   }
@@ -2066,6 +2130,13 @@ Http2Upstream::on_downstream_body(Downstream *downstream,
           }
           // Skip the copy path and fall through to resume / timer below.
           goto body_queued;
+        } else if (!data.empty() && log_enabled(INFO)) {
+          // ZC claim failed: no XLIO ZC socket on this connection, or data
+          // pointer is outside the current segment range.
+          Log{INFO, this}
+              << "[XLIO-ZC] COPY body appended: len=" << data.size()
+              << " stream=" << downstream->get_stream_id()
+              << " body_rleft_before=" << body->rleft();
         }
       }
     }
@@ -2103,10 +2174,14 @@ Http2Upstream::on_downstream_body(Downstream *downstream,
 
 body_queued:
 
-  if (flush) {
+  // Always resume the nghttp2 DATA provider and ensure the write timer is
+  // running.  If the stream was deferred (downstream_data_read_callback
+  // returned NGHTTP2_ERR_DEFERRED because both queues were momentarily empty
+  // between recv_zc batches), this wakes it up so the freshly-queued bytes
+  // are sent.  nghttp2_session_resume_data is a no-op when not deferred.
+  if (!data.empty() || flush) {
     nghttp2_session_resume_data(
       session_, static_cast<int32_t>(downstream->get_stream_id()));
-
     downstream->ensure_upstream_wtimer();
   }
 
@@ -2292,6 +2367,13 @@ Http2Upstream::on_downstream_reset(Downstream *downstream, bool no_retry) {
   }
 
   if (!downstream->request_submission_ready()) {
+    if (log_enabled(INFO)) {
+      Log{INFO, downstream}
+          << "[XLIO-ZC-DIAG] on_downstream_reset: response_state="
+          << static_cast<int>(downstream->get_response_state())
+          << " zc_body_rleft=" << downstream->get_zc_body_rleft()
+          << " body_rleft=" << downstream->get_response_buf()->rleft();
+    }
     if (downstream->get_response_state() == DownstreamState::MSG_COMPLETE) {
       // We have got all response body already.  Send it off.
       downstream->pop_downstream_connection();

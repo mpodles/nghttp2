@@ -176,6 +176,25 @@ namespace {
 void prepare_cb(struct ev_loop *loop, ev_prepare *w, int revents) {
   auto http2session = static_cast<Http2Session *>(w->data);
   http2session->check_retire();
+
+  /*
+   * [XLIO-ZC] After xlio_buf_free() returns a DMA buffer to the XLIO pool,
+   * XLIO can process bytes that were previously stuck in rcvbuff (moved from
+   * the kernel socket buffer into XLIO's internal queue but not yet delivered
+   * as ZC segments due to buffer pressure).  XLIO does NOT re-signal epoll
+   * readability for those bytes — they will only appear in the next recv_zc()
+   * call.  Without this retry, the request would hang indefinitely.
+   *
+   * Calling read_() here is cheap: if recv_zc() returns EAGAIN (nothing ready)
+   * it returns write_tls() immediately.  We only do this when connected and
+   * using the ZC read path to avoid unnecessary overhead.
+   */
+  if (http2session->get_state() == Http2SessionState::CONNECTED &&
+      http2session->is_xlio_zcopy_rx()) {
+    if (!http2session->do_read()) {
+      delete http2session;
+    }
+  }
 }
 } // namespace
 
@@ -205,7 +224,8 @@ Http2Session::Http2Session(struct ev_loop *loop, SSL_CTX *ssl_ctx,
     xlio_zcopy_rx_(false),
     xlio_zc_first_seg_logged_(false),
     pending_rx_chunk_(nullptr),
-    pending_zc_seg_(nullptr) {
+    pending_zc_seg_(nullptr),
+    zc_claim_count_(0) {
   read_ = write_ = &Http2Session::noop;
 
   on_read_ = &Http2Session::read_noop;
@@ -1739,7 +1759,11 @@ Http2Session::downstream_read(std::span<const uint8_t> data) {
   if (nghttp2_session_want_read(session_) == 0 &&
       nghttp2_session_want_write(session_) == 0 && wb_.rleft() == 0) {
     if (log_enabled(INFO)) {
-      Log{INFO, this} << "No more read/write for this HTTP2 session";
+      Log{INFO, this} << "No more read/write for this HTTP2 session"
+                      << " [XLIO-ZC-DIAG] want_read="
+                      << nghttp2_session_want_read(session_)
+                      << " want_write=" << nghttp2_session_want_write(session_)
+                      << " wb_rleft=" << wb_.rleft();
     }
     return std::unexpected{Error::DONE};
   }
@@ -1770,8 +1794,35 @@ std::expected<void, Error> Http2Session::downstream_write() {
   if (nghttp2_session_want_read(session_) == 0 &&
       nghttp2_session_want_write(session_) == 0 && wb_.rleft() == 0) {
     if (log_enabled(INFO)) {
-      Log{INFO, this} << "No more read/write for this session";
+      Log{INFO, this} << "No more read/write for this session"
+                      << " [XLIO-ZC-DIAG] want_read="
+                      << nghttp2_session_want_read(session_)
+                      << " want_write=" << nghttp2_session_want_write(session_)
+                      << " wb_rleft=" << wb_.rleft();
     }
+
+    /*
+     * [XLIO-ZC] If any downstream still has ZcBodyRefs waiting to be sent
+     * to the client, don't tear down the backend session yet.  The frontend
+     * write will drain them on the next libev iteration; we reschedule the
+     * backend write watcher so downstream_write() is re-evaluated once the
+     * frontend is done.
+     */
+    for (auto *dc = dconns_.head; dc; dc = dc->dlnext) {
+      auto *ds = dc->get_downstream();
+      if (ds && !ds->zc_body_empty()) {
+        if (log_enabled(INFO)) {
+          Log{INFO, this}
+              << "[XLIO-ZC] deferring backend DONE: downstream stream="
+              << ds->get_stream_id()
+              << " has zc_rleft=" << ds->get_zc_body_rleft()
+              << " — waiting for frontend to drain ZcBodyRefs";
+        }
+        signal_write(); // re-arm backend write watcher for next check
+        return {};      // do NOT propagate DONE yet
+      }
+    }
+
     return std::unexpected{Error::DONE};
   }
 
@@ -2182,9 +2233,14 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
     int nseg = xa.recv_zc(conn_.fd, segs, SHRPX_XLIO_MAX_SEGS);
 
     if (nseg < 0) {
+      if (log_enabled(INFO)) {
+        Log{INFO, this} << "read_tls_zcopy: recv_zc errno=" << errno
+                        << " (" << strerror(errno) << ")";
+      }
       switch (errno) {
+ 
       case EAGAIN:
-        /* No data yet – the libev watcher will fire again when data arrives. */
+        /* ZC queue empty — return and let libev re-fire when data arrives. */
         return write_tls();
 
       case ENODATA:
@@ -2258,43 +2314,86 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
      * If the segment contains only non-DATA frames (HEADERS, SETTINGS, etc.)
      * the buf is not claimed and we release it normally after on_read().
      */
+    // [XLIO-ZC] If on_read returns Error::DONE mid-loop, save it here and
+    // break so write_tls() can flush pending ZcBodyRefs before we close.
+    std::expected<void, Error> deferred_done{};
+
     for (int i = 0; i < nseg; ++i) {
       auto data = std::span{static_cast<const uint8_t *>(segs[i].data),
                             segs[i].len};
 
-      pending_zc_seg_ = &segs[i]; // expose to try_claim_zc_buf()
-      auto rv = on_read(data);
-      bool claimed = (pending_zc_seg_ == nullptr); // cleared if DATA body claimed
-      pending_zc_seg_ = nullptr; // always reset
-
-      if (log_enabled(INFO) && claimed) {
-        Log{INFO, this} << "[XLIO-ZC] ZC buf claimed for DATA body:"
-                        << " seg=" << i << " len=" << segs[i].len
-                        << " buf=" << static_cast<void *>(segs[i].buf)
-                        << " (release_zc skipped, freed on TX ACK)";
+      if (log_enabled(INFO)) {
+        Log{INFO, this} << "[XLIO-ZC-DIAG] processing seg=" << i
+                        << "/" << nseg << " len=" << segs[i].len;
       }
 
-      if (!claimed) {
+      // Expose segment to try_claim_zc_buf() for the duration of on_read().
+      // Multiple on_downstream_body() callbacks may fire (one per HTTP/2 DATA
+      // frame body within this TLS record).  Each successful claim increments
+      // zc_claim_count_; additional claims beyond the first also call
+      // buf_add_ref() so each ZcBodyRef holds an independent lwip pbuf ref.
+      pending_zc_seg_ = &segs[i];
+      zc_claim_count_ = 0;
+      auto rv = on_read(data);
+      pending_zc_seg_ = nullptr; // always reset after on_read
+
+      if (log_enabled(INFO)) {
+        Log{INFO, this} << "[XLIO-ZC] seg=" << i << " claims=" << zc_claim_count_
+                        << " len=" << segs[i].len
+                        << " buf=" << static_cast<void *>(segs[i].buf)
+                        << (zc_claim_count_ > 0 ? " (ZC, freed on TX ACK)"
+                                                 : " (no DATA, release_zc)");
+      }
+
+      if (zc_claim_count_ == 0) {
+        // No DATA frame body in this segment (HEADERS only, or empty).
+        // Release the recv_zc ref we were holding.
         xa.release_zc(segs[i].buf);
       }
-      /* If claimed: buf lifetime is managed by ZcRxOwner → freed on TCP ACK */
+      // If claimed: each ZcBodyRef holds its own ref → ZcRxOwner frees on ACK.
 
       if (!rv) {
-        /* Release remaining buffers before propagating the error. */
+        /* Release remaining buffers regardless of error type. */
         for (int j = i + 1; j < nseg; ++j) {
           xa.release_zc(segs[j].buf);
         }
-        return rv;
+
+        if (rv.error() == Error::DONE) {
+          /*
+           * [XLIO-ZC] Backend session cleanly done (END_STREAM + GOAWAY).
+           * ZcBodyRefs from this batch are queued but not yet sent.
+           * Break out and let write_tls() flush them to the client first,
+           * then propagate DONE to tear down the backend connection.
+           */
+          if (log_enabled(INFO)) {
+            Log{INFO, this}
+                << "[XLIO-ZC] backend DONE at seg=" << i
+                << " — will flush pending ZC data to client before close";
+          }
+          deferred_done = rv; // save, propagate after write_tls()
+          break;
+        }
+
+        return rv; // genuine error: propagate immediately
       }
     }
 
     /*
-     * After processing all segments, drive the write path so nghttp2 can
-     * send pending WINDOW_UPDATE / SETTINGS_ACK frames that may have been
-     * queued by the callbacks above.
+     * After processing all segments, drive the write path:
+     *  - WINDOW_UPDATE / SETTINGS_ACK for the backend
+     *  - ZcBodyRefs from this batch sent to the client via send_data_callback
      */
     if (auto rv = write_tls(); !rv) {
       return rv;
+    }
+
+    // If the backend session ended cleanly, propagate DONE now (after flush).
+    if (!deferred_done) {
+      if (log_enabled(INFO)) {
+        Log{INFO, this}
+            << "[XLIO-ZC] propagating deferred DONE after write_tls flush";
+      }
+      return deferred_done;
     }
   }
 }

@@ -143,18 +143,11 @@ Log::Log(int severity, const std::source_location loc)
 
   auto tty = lgconf->errorlog_tty;
 
-  lgconf->update_tstamp_millis(std::chrono::system_clock::now());
-
-  // Error log format: <datetime> <main-pid> <current-pid>
-  // <thread-id> <level> (<filename>:<line>) <msg>
-  last_ = std::ranges::copy(lgconf->tstamp->time_iso8601, last_).out;
-  *last_++ = ' ';
-  last_ = util::utos(as_unsigned(config->pid), last_);
-  *last_++ = ' ';
-  last_ = util::utos(as_unsigned(lgconf->pid), last_);
-  *last_++ = ' ';
-  last_ = std::ranges::copy(lgconf->thread_id, last_).out;
-  *last_++ = ' ';
+  // Error log format: <level> (<filename>:<line>) <msg>
+  auto slash = filename_.rfind('/');
+  if (slash != std::string_view::npos) {
+    filename_ = filename_.substr(slash + 1);
+  }
 
   if (tty) {
     last_ = std::ranges::copy(SEVERITY_COLOR[severity_], last_).out;

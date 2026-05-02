@@ -273,16 +273,35 @@ public:
 
   bool get_allow_connect_proto() const;
 
-  // [XLIO-ZC] If |data| points into the current pending_zc_seg_ (a DMA buffer
-  // segment from xlio_recv_zc_fd), return the xlio_buf handle and clear the
-  // pending pointer.  The caller now owns the buf and must NOT call release_zc.
-  // Returns nullptr if no pending ZC seg or pointer is out of range.
+  // [XLIO-ZC] True if this session is using the zero-copy RX path.
+  bool is_xlio_zcopy_rx() const { return xlio_zcopy_rx_; }
+
+  // [XLIO-ZC] Multi-claim zero-copy buffer accessor.
+  //
+  // Returns the xlio_buf handle if |data| points anywhere inside the current
+  // pending ZC segment, allowing multiple HTTP/2 DATA frame bodies within the
+  // same TLS record (DMA buffer) to each get their own ZcBodyRef.
+  //
+  // Ownership rules:
+  //   First claim  — consumes the single ref that xlio_recv_zc_fd() granted.
+  //   2nd+ claims  — each calls XlioAdapter::buf_add_ref() to acquire an
+  //                  additional ref so ZcRxOwner::put() can independently
+  //                  free it on TCP ACK without racing with other sends.
+  //
+  // pending_zc_seg_ is NOT cleared here; it stays alive for the entire
+  // on_read() call and is reset to nullptr by read_tls_zcopy() afterward.
+  // The caller (on_downstream_body) must NOT call release_zc() for claimed bufs.
   xlio_buf_opaque *try_claim_zc_buf(const uint8_t *data) {
     if (!pending_zc_seg_) return nullptr;
     const auto *base = static_cast<const uint8_t *>(pending_zc_seg_->data);
     if (data < base || data >= base + pending_zc_seg_->len) return nullptr;
-    auto *buf      = pending_zc_seg_->buf;
-    pending_zc_seg_ = nullptr;
+    auto *buf = pending_zc_seg_->buf;
+    if (zc_claim_count_ > 0) {
+      // Additional claim: need an extra lwip pbuf ref so this ZcBodyRef has
+      // its own lifetime independent of all other claims on the same buffer.
+      XlioAdapter::get().buf_add_ref(buf);
+    }
+    ++zc_claim_count_;
     return buf;
   }
 
@@ -372,12 +391,17 @@ private:
   /*
    * [XLIO-ZC] Non-null during a read_tls_zcopy() segment processing cycle.
    * Points to the current xlio ZC segment (DMA buffer + length).
-   * try_claim_zc_buf() claims it when on_downstream_body() sees data that
-   * lives in this segment.  After on_read() returns the pointer is either
-   * nullptr (claimed, ownership transferred to Downstream::zc_body_queue_)
-   * or still set (not claimed → release_zc must be called).
+   * try_claim_zc_buf() records each DATA-body claim in zc_claim_count_.
+   * After on_read() returns:
+   *   zc_claim_count_ == 0  → no DATA in this segment; read_tls_zcopy calls
+   *                           release_zc() to free the recv_zc ref.
+   *   zc_claim_count_ > 0   → each ZcBodyRef holds its own ref (1st claim
+   *                           uses the recv_zc ref, subsequent ones add a ref
+   *                           via XlioAdapter::buf_add_ref).  release_zc NOT
+   *                           called; every ZcRxOwner::put() fires on ACK.
    */
   const shrpx_xlio_zc_seg *pending_zc_seg_;
+  int                       zc_claim_count_; // number of ZcBodyRefs for current seg
 };
 
 nghttp2_session_callbacks *create_http2_downstream_callbacks();

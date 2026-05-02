@@ -165,6 +165,17 @@ public:
     /** Release one buffer returned by recv_zc(). */
     void release_zc(xlio_buf_opaque *buf) const { release_zc_(buf); }
 
+    /**
+     * Increment the reference count of a buffer returned by recv_zc().
+     * Call once for each additional sendv_zc() that will reference this
+     * buffer beyond the first (the first sendv_zc consumes the recv_zc ref).
+     * Each ref is released by ZcRxOwner::put() on TCP ACK.
+     */
+    void buf_add_ref(xlio_buf_opaque *buf) const
+    {
+        if (buf_addref_ && buf) buf_addref_(buf);
+    }
+
     /* ------------------------------------------------------------------ */
     /* Ultra API: socket handle                                            */
     /* ------------------------------------------------------------------ */
@@ -284,6 +295,7 @@ private:
     /* RX zero-copy — these are exported symbols, dlsym works. */
     using recv_zc_fn_t    = int  (*)(int, shrpx_xlio_zc_seg *, int);
     using release_zc_fn_t = void (*)(xlio_buf_opaque *);
+    using buf_addref_fn_t = void (*)(xlio_buf_opaque *);
 
     /* Ultra TX */
     using socket_from_fd_fn_t  = shrpx_xlio_socket_t (*)(int);
@@ -302,6 +314,7 @@ private:
 
     recv_zc_fn_t          recv_zc_            {nullptr};
     release_zc_fn_t       release_zc_         {nullptr};
+    buf_addref_fn_t       buf_addref_         {nullptr};
 
     socket_from_fd_fn_t   socket_from_fd_     {nullptr};
     socket_sendv_fn_t     socket_sendv_       {nullptr};
@@ -327,6 +340,9 @@ private:
             recv_zc_    = nullptr;
             release_zc_ = nullptr;
         }
+        /* xlio_buf_addref is co-located with the RX ZC symbols in sock-extra. */
+        buf_addref_ = reinterpret_cast<buf_addref_fn_t>(
+            ::dlsym(RTLD_DEFAULT, "xlio_buf_addref"));
 
         /*
          * xlio_socket_from_fd is also exported (EXPORT_SYMBOL), dlsym works.
