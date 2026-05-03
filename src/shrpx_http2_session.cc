@@ -2287,18 +2287,22 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
      * buffer as soon as it is consumed, reducing peak memory pressure.  For
      * the common single-buffer case this is identical in performance.
      */
-    zcopy_stats().recv_zc_segs.fetch_add(static_cast<uint64_t>(nseg),
-                                         std::memory_order_relaxed);
-
-    /* One-shot INFO log: first time we actually deliver data zero-copy. */
-    if (log_enabled(INFO) && !xlio_zc_first_seg_logged_) {
-      xlio_zc_first_seg_logged_ = true;
+    {
+      auto &zs = zcopy_stats();
       size_t total_len = 0;
       for (int k = 0; k < nseg; ++k) total_len += segs[k].len;
-      Log{INFO, this} << "read_tls_zcopy: first ZC delivery nseg=" << nseg
-                      << " total_bytes=" << total_len
-                      << " tls_type=" << static_cast<unsigned>(segs[0].tls_type)
-                      << " (expect 23=0x17 for UTLS_RX application data)";
+      zs.recv_zc_segs.fetch_add(static_cast<uint64_t>(nseg),
+                                std::memory_order_relaxed);
+      zs.recv_zc_bytes.fetch_add(static_cast<uint64_t>(total_len),
+                                 std::memory_order_relaxed);
+
+      /* One-shot INFO log: first time we actually deliver data zero-copy. */
+      if (log_enabled(INFO) && !xlio_zc_first_seg_logged_) {
+        xlio_zc_first_seg_logged_ = true;
+        PROBNIK_LOG(PROBNIK_INFO, "zc-trace",
+                    "first ZC delivery nseg=%d total_bytes=%zu tls_type=%d (expect 23=0x17 for UTLS_RX application data)",
+                    nseg, total_len, static_cast<unsigned>(segs[0].tls_type));
+      }
     }
 
     /*
@@ -2322,10 +2326,9 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
       auto data = std::span{static_cast<const uint8_t *>(segs[i].data),
                             segs[i].len};
 
-      if (log_enabled(INFO)) {
-        Log{INFO, this} << "[XLIO-ZC-DIAG] processing seg=" << i
-                        << "/" << nseg << " len=" << segs[i].len;
-      }
+      PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+                  "processing seg=%d/%d len=%lu",
+                  i, nseg, segs[i].len);
 
       // Expose segment to try_claim_zc_buf() for the duration of on_read().
       // Multiple on_downstream_body() callbacks may fire (one per HTTP/2 DATA
@@ -2337,18 +2340,20 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
       auto rv = on_read(data);
       pending_zc_seg_ = nullptr; // always reset after on_read
 
-      if (log_enabled(INFO)) {
-        Log{INFO, this} << "[XLIO-ZC] seg=" << i << " claims=" << zc_claim_count_
-                        << " len=" << segs[i].len
-                        << " buf=" << static_cast<void *>(segs[i].buf)
-                        << (zc_claim_count_ > 0 ? " (ZC, freed on TX ACK)"
-                                                 : " (no DATA, release_zc)");
-      }
+      PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+                  "seg=%d claims=%d len=%lu buf=%p%s",
+                  i, zc_claim_count_, segs[i].len, static_cast<void *>(segs[i].buf),
+                  (zc_claim_count_ > 0 ? " (ZC, freed on TX ACK)" : " (no DATA, release_zc)"));
+             
 
       if (zc_claim_count_ == 0) {
         // No DATA frame body in this segment (HEADERS only, or empty).
         // Release the recv_zc ref we were holding.
         xa.release_zc(segs[i].buf);
+        auto &zs = zcopy_stats();
+        zs.recv_zc_unclaimed_segs.fetch_add(1, std::memory_order_relaxed);
+        zs.recv_zc_unclaimed_bytes.fetch_add(segs[i].len,
+                                             std::memory_order_relaxed);
       }
       // If claimed: each ZcBodyRef holds its own ref → ZcRxOwner frees on ACK.
 
@@ -2365,11 +2370,9 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
            * Break out and let write_tls() flush them to the client first,
            * then propagate DONE to tear down the backend connection.
            */
-          if (log_enabled(INFO)) {
-            Log{INFO, this}
-                << "[XLIO-ZC] backend DONE at seg=" << i
-                << " — will flush pending ZC data to client before close";
-          }
+          PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+                      "backend DONE at seg=%d — will flush pending ZC data to client before close",
+                      i);
           deferred_done = rv; // save, propagate after write_tls()
           break;
         }
@@ -2389,10 +2392,8 @@ std::expected<void, Error> Http2Session::read_tls_zcopy() {
 
     // If the backend session ended cleanly, propagate DONE now (after flush).
     if (!deferred_done) {
-      if (log_enabled(INFO)) {
-        Log{INFO, this}
-            << "[XLIO-ZC] propagating deferred DONE after write_tls flush";
-      }
+      PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+                  "propagating deferred DONE after write_tls flush");
       return deferred_done;
     }
   }

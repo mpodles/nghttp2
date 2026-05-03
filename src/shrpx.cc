@@ -119,6 +119,8 @@
 #include "template.h"
 #include "allocator.h"
 #include "xsi_strerror.h"
+#include "shrpx_zcopy_stats.h"
+#include "probnik.h"
 
 extern char **environ;
 
@@ -3675,6 +3677,8 @@ int main(int argc, char **argv) {
 #ifdef HAVE_LIBBPF
   libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 #endif // HAVE_LIBBPF
+
+  shrpx::zcopy_stats_register();
 
   Log::set_severity_level(NOTICE);
   create_config();

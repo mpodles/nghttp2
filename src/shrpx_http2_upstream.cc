@@ -891,6 +891,13 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
         return NGHTTP2_ERR_CALLBACK_FAILURE;
       }
 
+      {
+        auto &zs = zcopy_stats();
+        zs.send_zc_frames.fetch_add(1, std::memory_order_relaxed);
+        zs.send_zc_bytes.fetch_add(static_cast<uint64_t>(ref.len),
+                                   std::memory_order_relaxed);
+      }
+
       // Bookkeeping (same as copy path).
       if (downstream->zc_body_empty() && body->rleft() == 0) {
         downstream->disable_upstream_wtimer();
@@ -2121,22 +2128,27 @@ Http2Upstream::on_downstream_body(Downstream *downstream,
       if (auto *http2session = dconn->get_http2session()) {
         if (auto *buf = http2session->try_claim_zc_buf(data.data())) {
           downstream->push_zc_body(data.data(), data.size(), buf);
-          if (log_enabled(INFO)) {
-            Log{INFO, this}
-                << "[XLIO-ZC] ZC body queued: len=" << data.size()
-                << " stream=" << downstream->get_stream_id()
-                << " buf=" << static_cast<void *>(buf)
-                << " total_zc_rleft=" << downstream->get_zc_body_rleft();
+          {
+            auto &zs = zcopy_stats();
+            zs.zc_queued_bytes.fetch_add(data.size(),
+                                         std::memory_order_relaxed);
+            zs.zc_queued_count.fetch_add(1, std::memory_order_relaxed);
           }
+          PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+             "ZC body queued: len=%ld stream=%ld buf=%p total_zc_rleft=%ld",
+              data.size(), downstream->get_stream_id(), static_cast<void *>(buf),
+              downstream->get_zc_body_rleft());
           // Skip the copy path and fall through to resume / timer below.
           goto body_queued;
-        } else if (!data.empty() && log_enabled(INFO)) {
+        } else if (!data.empty()) {
           // ZC claim failed: no XLIO ZC socket on this connection, or data
           // pointer is outside the current segment range.
-          Log{INFO, this}
-              << "[XLIO-ZC] COPY body appended: len=" << data.size()
-              << " stream=" << downstream->get_stream_id()
-              << " body_rleft_before=" << body->rleft();
+          zcopy_stats().copy_queued_bytes.fetch_add(data.size(),
+                                                    std::memory_order_relaxed);
+
+          PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+             "COPY body appended: len=%ld stream=%ld body_rleft_before=%ld",
+              data.size(), downstream->get_stream_id(), body->rleft());
         }
       }
     }

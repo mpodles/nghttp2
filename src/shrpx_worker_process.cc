@@ -65,6 +65,7 @@
 #include "template.h"
 #include "xsi_strerror.h"
 #include "shrpx_zcopy_stats.h"
+#include "probnik.h"
 
 using namespace nghttp2;
 
@@ -189,7 +190,6 @@ void ipc_readcb(struct ev_loop *loop, ev_io *w, int revents) {
       break;
     case SHRPX_IPC_REOPEN_LOG:
       reopen_log(conn_handler);
-      zcopy_stats_print();
       break;
     }
   }
