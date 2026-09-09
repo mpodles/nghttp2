@@ -473,8 +473,20 @@ std::expected<void, Error> Http2Session::initiate_connection() {
 
         auto tls_session = tls::reuse_tls_session(addr_->tls_session_cache);
         if (tls_session) {
+          PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                      "attempting resumption fd=%d addr=%p cache=%p"
+                      " session_proto=%#x ctx_min=%#x ctx_max=%#x",
+                      conn_.fd, (void *)addr_,
+                      (void *)&addr_->tls_session_cache,
+                      SSL_SESSION_get_protocol_version(tls_session),
+                      get_config()->tls.min_proto_version,
+                      get_config()->tls.max_proto_version);
           SSL_set_session(conn_.tls.ssl, tls_session);
           SSL_SESSION_free(tls_session);
+        } else {
+          PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                      "no cached session, full handshake fd=%d addr=%p",
+                      conn_.fd, (void *)addr_);
         }
       }
 

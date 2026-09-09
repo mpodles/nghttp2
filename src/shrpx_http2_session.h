@@ -141,6 +141,11 @@ public:
 
   nghttp2_session *get_session() const;
 
+  // Raw fd of the downstream connection, for callers that need to query
+  // XLIO state (e.g. protection-domain checks for cross-socket zero-copy
+  // relay) without going through the full read/write path.
+  int get_fd() const { return conn_.fd; }
+
   std::expected<void, Error> resume_data(Http2DownstreamConnection *dconn);
 
   std::expected<void, Error> connection_made();

@@ -68,6 +68,8 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include "probnik.h"
+
 #ifdef ENABLE_HTTP3
 #  include <ngtcp2/ngtcp2.h>
 #  include <ngtcp2/ngtcp2_crypto.h>
@@ -390,6 +392,15 @@ int cert_cb(SSL *ssl, void *arg) {
 namespace {
 int tls_session_client_new_cb(SSL *ssl, SSL_SESSION *session) {
   auto conn = static_cast<Connection *>(SSL_get_app_data(ssl));
+
+  PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+              "new_session_cb fd=%d conn_proto=%s session_proto=%#x"
+              " cipher=%s cache=%p",
+              conn->fd, SSL_get_version(ssl),
+              SSL_SESSION_get_protocol_version(session),
+              SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)),
+              (void *)conn->tls.client_session_cache);
+
   if (conn->tls.client_session_cache == nullptr) {
     return 0;
   }
@@ -2409,6 +2420,11 @@ void try_cache_tls_session(TLSSessionCache *cache, SSL_SESSION *session,
     if (log_enabled(INFO)) {
       Log{INFO} << "Client session cache entry is still fresh.";
     }
+    PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                "try_cache_tls_session cache=%p SKIPPED (fresh) session_proto=%#x"
+                " existing_data_len=%zu",
+                (void *)cache, SSL_SESSION_get_protocol_version(session),
+                cache->session_data.size());
     return;
   }
 
@@ -2419,15 +2435,41 @@ void try_cache_tls_session(TLSSessionCache *cache, SSL_SESSION *session,
 
   cache->session_data = serialize_ssl_session(session);
   cache->last_updated = t;
+
+  PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+              "try_cache_tls_session cache=%p UPDATED session_proto=%#x"
+              " serialized_len=%zu",
+              (void *)cache, SSL_SESSION_get_protocol_version(session),
+              cache->session_data.size());
 }
 
 SSL_SESSION *reuse_tls_session(const TLSSessionCache &cache) {
   if (cache.session_data.empty()) {
+    PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                "reuse_tls_session cache=%p EMPTY, no resumption attempted",
+                (const void *)&cache);
     return nullptr;
   }
 
   auto p = cache.session_data.data();
-  return d2i_SSL_SESSION(nullptr, &p, as_signed(cache.session_data.size()));
+  auto session =
+      d2i_SSL_SESSION(nullptr, &p, as_signed(cache.session_data.size()));
+
+  if (session == nullptr) {
+    PROBNIK_LOG(PROBNIK_ERROR, "tls-resume",
+                "reuse_tls_session cache=%p d2i_SSL_SESSION FAILED to"
+                " deserialize %zu cached bytes",
+                (const void *)&cache, cache.session_data.size());
+  } else {
+    PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                "reuse_tls_session cache=%p deserialized session_proto=%#x"
+                " cached_bytes=%zu",
+                (const void *)&cache,
+                SSL_SESSION_get_protocol_version(session),
+                cache.session_data.size());
+  }
+
+  return session;
 }
 
 int proto_version_from_string(std::string_view v) {

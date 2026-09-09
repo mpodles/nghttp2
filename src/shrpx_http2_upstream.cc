@@ -804,6 +804,44 @@ int on_frame_not_send_callback(nghttp2_session *session,
 constexpr auto PADDING = std::array<uint8_t, 256>{};
 
 namespace {
+// [XLIO-ZC] Single source of truth for "can this backend response body be
+// relayed to the client via zero-copy?" Both the decision to queue a chunk
+// into zc_body_queue_ (on_downstream_body) and the decision to actually
+// send it that way (send_data_callback) must agree on this, or nghttp2
+// commits to a DATA frame length that the eligible-vs-not-eligible split
+// then can't consistently deliver — the truncated/corrupted-frame bug this
+// guards against. Eligible only if the frontend has a usable Ultra TX
+// socket AND it shares a protection domain with the backend connection
+// that produced the buffer (sendv_zc() can't DMA-send a buffer registered
+// under a different PD).
+bool zc_relay_eligible(Http2Upstream *upstream, Http2Session *backend) {
+  if (!backend) return false;
+  auto &xa    = XlioAdapter::get();
+  auto  csock = upstream->get_client_handler()->get_connection()->xlio_sock;
+  if (!csock || !xa.has_ultra_tx()) return false;
+  auto  backend_sock = xa.socket_from_fd(backend->get_fd());
+  auto *csock_pd      = xa.get_pd(csock);
+  auto *backend_pd    = xa.get_pd(backend_sock);
+  bool  eligible      = backend_pd && backend_pd == csock_pd;
+  if (!eligible) {
+    // [XLIO-ZC] Breaks down *why* eligibility failed: backend_sock==0 means
+    // xlio_socket_from_fd() itself failed for the backend fd (per its
+    // contract in sock-extra.cpp, only if the fd isn't XLIO-managed or isn't
+    // a sockinfo_tcp — shouldn't happen for a live backend connection);
+    // backend_sock!=0 but backend_pd==nullptr means the handle was obtained
+    // but its ib_ctx_handler/ibv_pd isn't set up; both non-null but unequal
+    // means frontend and backend are genuinely on different rings/devices.
+    PROBNIK_LOG(PROBNIK_DEBUG, "zc-trace",
+                "zc_relay_eligible FALSE: backend_fd=%d backend_sock=%d"
+                " backend_pd=%p csock=%d csock_pd=%p",
+                backend->get_fd(), static_cast<bool>(backend_sock),
+                (void *)backend_pd, static_cast<bool>(csock), (void *)csock_pd);
+  }
+  return eligible;
+}
+} // namespace
+
+namespace {
 int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
                        const uint8_t *framehd, size_t length,
                        nghttp2_data_source *source, void *user_data) {
@@ -832,7 +870,38 @@ int send_data_callback(nghttp2_session *session, nghttp2_frame *frame,
   if (!downstream->zc_body_empty() && frame->data.padlen == 0) {
     auto &xa    = XlioAdapter::get();
     auto  csock = upstream->get_client_handler()->get_connection()->xlio_sock;
-    if (csock && xa.has_ultra_tx()) {
+
+    // [XLIO-ZC] Deliberately NOT re-deriving backend/PD eligibility here via
+    // zc_relay_eligible(): by the time send_data_callback runs, nghttp2 may
+    // have already detached this Downstream's DownstreamConnection back into
+    // the backend pool (happens as soon as the backend response is fully
+    // read, well before all DATA frames finish sending to the client) —
+    // downstream->get_downstream_connection() can be null here even though
+    // everything currently in zc_body_queue_ was correctly vetted against
+    // the backend's PD at queue time (on_downstream_body, before the
+    // connection could be detached). Re-checking against a possibly-gone
+    // backend here produced false negatives (queued-eligible chunks
+    // reported ineligible at send time, every time, once the backend
+    // detached first) — found live 2026-09-07. Only the frontend side can
+    // actually change between queue and send time, so only check that.
+    bool eligible = csock && xa.has_ultra_tx();
+
+    if (!eligible) {
+      // [XLIO-ZC] Falling through to the copy path below drains `body`
+      // (downstream->get_response_buf()), NOT zc_body_queue_, so if this
+      // frame's bytes were only ever queued in zc_body_queue_, they're lost:
+      // a corrupted/truncated DATA frame. Should be rare — only a frontend
+      // connection that lost its Ultra socket between queue and send time.
+      PROBNIK_LOG(PROBNIK_ERROR, "tls-resume",
+                  "[XLIO-ZC] send_data_callback INELIGIBLE-AT-SEND stream=%d"
+                  " frame_len=%zu zc_queue=%zu body_rleft=%zu csock=%d"
+                  " has_ultra_tx=%d — falling through to copy path, which"
+                  " will NOT send the queued ZC bytes if body is empty"
+                  " (frame may be truncated/corrupted)",
+                  frame->hd.stream_id, length, downstream->get_zc_body_rleft(),
+                  body->rleft(), static_cast<bool>(csock), xa.has_ultra_tx());
+    }
+    if (eligible) {
 
       // 1. Flush wb_ (HEADERS frames) to the TLS socket BEFORE the DATA frame.
       if (!upstream->flush_response_buf()) {
@@ -2126,7 +2195,14 @@ Http2Upstream::on_downstream_body(Downstream *downstream,
         downstream->get_downstream_connection());
     if (dconn) {
       if (auto *http2session = dconn->get_http2session()) {
-        if (auto *buf = http2session->try_claim_zc_buf(data.data())) {
+        // Only claim the ZC buffer if the frontend can actually relay it
+        // (see zc_relay_eligible()) — otherwise fall through to the normal
+        // copy path below exactly as if try_claim_zc_buf() had failed. This
+        // is what send_data_callback()'s eligibility check depends on: it
+        // must never see a queued chunk it can't actually send.
+        if (auto *buf = zc_relay_eligible(this, http2session)
+                            ? http2session->try_claim_zc_buf(data.data())
+                            : nullptr) {
           downstream->push_zc_body(data.data(), data.size(), buf);
           {
             auto &zs = zcopy_stats();

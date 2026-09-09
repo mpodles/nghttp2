@@ -56,6 +56,10 @@
 #  define SHRPX_HAVE_XLIO_EXTRA_H 1
 #endif
 
+#ifndef SHRPX_HAVE_XLIO_EXTRA_H
+struct ibv_pd;
+#endif
+
 namespace shrpx {
 
 /** Maximum number of zero-copy segments to request in a single call. */
@@ -199,6 +203,19 @@ public:
         return socket_from_fd_(fd);
     }
 
+    /**
+     * Protection domain backing sock's registered memory. Two sockets can
+     * only exchange a zero-copy buffer (RX buffer from one handed to
+     * sendv_zc() on the other) if they share a PD, which in practice means
+     * they're on the same XLIO ring/NIC port. Returns nullptr if the Ultra
+     * API doesn't expose this (has_ultra_tx() false) or sock is invalid.
+     */
+    struct ibv_pd *get_pd(shrpx_xlio_socket_t sock) const
+    {
+        if (!get_pd_ || !sock) return nullptr;
+        return get_pd_(sock);
+    }
+
     /* ------------------------------------------------------------------ */
     /* Ultra API: send                                                     */
     /* ------------------------------------------------------------------ */
@@ -304,6 +321,7 @@ private:
                                           const shrpx_xlio_send_attr *);
     using socket_flush_fn_t    = void (*)(shrpx_xlio_socket_t);
     using buf_get_mkey_fn_t    = std::uint32_t (*)(xlio_buf_opaque *);
+    using get_pd_fn_t          = struct ibv_pd *(*)(shrpx_xlio_socket_t);
 
     /* Poll group */
     using poll_group_create_fn_t  = int  (*)(const shrpx_xlio_poll_group_attr *,
@@ -320,6 +338,7 @@ private:
     socket_sendv_fn_t     socket_sendv_       {nullptr};
     socket_flush_fn_t     socket_flush_       {nullptr};
     buf_get_mkey_fn_t     buf_get_mkey_       {nullptr};
+    get_pd_fn_t           get_pd_             {nullptr};
 
     poll_group_create_fn_t  poll_group_create_  {nullptr};
     poll_group_destroy_fn_t poll_group_destroy_ {nullptr};
@@ -376,6 +395,8 @@ private:
                 api->xlio_socket_flush);
             buf_get_mkey_       = reinterpret_cast<buf_get_mkey_fn_t>(
                 api->xlio_socket_buf_get_mkey);
+            get_pd_             = reinterpret_cast<get_pd_fn_t>(
+                api->xlio_socket_get_pd);
 
             /* Require sendv for Ultra TX to be considered available. */
             if (!socket_sendv_) {

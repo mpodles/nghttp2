@@ -44,6 +44,7 @@
 #include "shrpx_log.h"
 #include "memchunk.h"
 #include "util.h"
+#include "probnik.h"
 
 using namespace nghttp2;
 using namespace std::chrono_literals;
@@ -89,6 +90,11 @@ Connection::Connection(struct ev_loop *loop, int fd, SSL *ssl,
   if (ssl) {
     set_ssl(ssl);
   }
+
+  PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+              "Connection::Connection constructed fd=%d this=%p ssl=%p"
+              " proto=%d",
+              fd, (void *)this, (void *)ssl, static_cast<int>(proto));
 }
 
 Connection::~Connection() { disconnect(); }
@@ -120,6 +126,9 @@ void Connection::disconnect() {
   }
 
   if (proto != Proto::HTTP3 && fd != -1) {
+    PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                "Connection::disconnect closing fd=%d this=%p xlio_sock=%d",
+                fd, (void *)this, static_cast<bool>(xlio_sock));
     shutdown(fd, SHUT_WR);
     close(fd);
     fd = -1;
@@ -292,6 +301,18 @@ std::expected<void, Error> Connection::tls_handshake() {
         Log{INFO} << "tls: handshake libssl error: "
                   << ERR_error_string(ERR_get_error(), nullptr);
       }
+      PROBNIK_LOG(PROBNIK_ERROR, "tls-resume",
+                  "tls_handshake libssl error fd=%d role=%s"
+                  " had_session_set=%d session_proto=%#x xlio_sock=%d",
+                  fd,
+                  (tls.client_session_cache != nullptr) ? "downstream"
+                                                         : "upstream",
+                  SSL_get_session(tls.ssl) != nullptr,
+                  SSL_get_session(tls.ssl)
+                      ? SSL_SESSION_get_protocol_version(
+                            SSL_get_session(tls.ssl))
+                      : 0,
+                  static_cast<bool>(xlio_sock));
       return std::unexpected{Error::NETWORK};
     }
     default:
@@ -350,6 +371,12 @@ std::expected<void, Error> Connection::tls_handshake() {
   }
 
   tls.initial_handshake_done = true;
+
+  PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+              "tls_handshake COMPLETE fd=%d this=%p in_init=%d proto=%s"
+              " reused=%d xlio_sock=%d",
+              fd, (void *)this, SSL_in_init(tls.ssl), SSL_get_version(tls.ssl),
+              SSL_session_reused(tls.ssl), static_cast<bool>(xlio_sock));
 
   return write_tls_pending_handshake();
 }
@@ -501,47 +528,16 @@ Connection::write_tls(std::span<const uint8_t> data) {
 
   tls.last_write_idle = std::chrono::steady_clock::time_point(-1s);
 
-  /*
-   * Ultra API TLS TX path (Level 1 experiment).
-   *
-   * When an XLIO Ultra socket handle is available AND the TLS handshake is
-   * complete, route the write through xlio_socket_sendv() instead of
-   * SSL_write().  The modified xlio_socket_sendv (sock-extra.cpp) detects
-   * UTLS_TX via dynamic_cast<sockinfo_tcp_ops_tls*> and redirects through
-   * si->tx() → sockinfo_tcp_ops_tls::tx() → TLS record framing →
-   * tcp_tx_express() → NIC AEAD encryption.  No SSL_write overhead.
-   *
-   * Success criterion: client receives a valid, decrypted HTTP/2 response.
-   * An "[xlio-ultra] UTLS_TX active → routing through TLS ops" line on
-   * stderr from XLIO confirms Level 1 is exercised.
-   *
-   * If this path is not desired, removing xlio_sock from tls_handshake()
-   * falls back to SSL_write permanently.
-   */
-  if (xlio_sock && SSL_is_init_finished(tls.ssl)) {
-    const struct iovec iov = {
-        .iov_base = const_cast<uint8_t *>(data.data()),
-        .iov_len  = data.size(),
-    };
-    auto &xa = XlioAdapter::get();
-    int rc = xa.sendv_inline(xlio_sock, &iov, 1, /*flush=*/true);
-    if (rc < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOMEM) {
-        tls.last_writelen = data.size();
-        wlimit.startw();
-        ev_timer_again(loop, &wt);
-        return 0;
-      }
-      return std::unexpected{Error::NETWORK};
-    }
-    wlimit.drain(data.size());
-    if (ev_is_active(&wt)) {
-      ev_timer_again(loop, &wt);
-    }
-    update_tls_warmup_writelen(data.size());
-    return data.size();
-  }
-
+  // TLS writes always go through SSL_write, never xlio_socket_sendv(). A
+  // prior "Level 1 experiment" routed writes through sendv_inline() on the
+  // assumption that XLIO would transparently detect UTLS_TX and add TLS
+  // record framing in hardware. Confirmed (2026-09-07, see
+  // subprojects/libxlio/CONTEXT.md) that this sent raw unencrypted
+  // application bytes onto the wire whenever that assumption didn't hold,
+  // which a compliant TLS client correctly rejects with a fatal
+  // protocol_version alert. Out of scope for now (see CONTEXT.md) — TLS-TX
+  // zero-copy needs a TLS-aware express-send path in libxlio before this is
+  // safe to re-enable.
   ERR_clear_error();
 
 #ifdef NGHTTP2_GENUINE_OPENSSL
@@ -720,7 +716,16 @@ Connection::read_tls(std::span<uint8_t> data) {
 #endif // defined(NGHTTP2_OPENSSL_IS_WOLFSSL) &&
        // defined(WOLFSSL_EARLY_DATA)
 
+  PROBNIK_LOG(PROBNIK_TRACE, "tls-resume",
+              "read_tls CALL fd=%d this=%p in_init=%d req_len=%zu"
+              " pending=%d handshake_done=%d",
+              fd, (void *)this, SSL_in_init(tls.ssl), data.size(),
+              SSL_pending(tls.ssl), tls.initial_handshake_done);
+
   auto rv = SSL_read(tls.ssl, data.data(), static_cast<int>(data.size()));
+
+  PROBNIK_LOG(PROBNIK_TRACE, "tls-resume",
+              "read_tls RETURN fd=%d this=%p rv=%d", fd, (void *)this, rv);
 
   if (rv <= 0) {
     auto err = SSL_get_error(tls.ssl, rv);
@@ -739,6 +744,21 @@ Connection::read_tls(std::span<uint8_t> data) {
       if (log_enabled(INFO)) {
         Log{INFO} << "SSL_read: " << ERR_error_string(ERR_get_error(), nullptr);
       }
+      PROBNIK_LOG(PROBNIK_ERROR, "tls-resume",
+                  "read_tls SSL_ERROR_SSL fd=%d role=%s in_init=%d"
+                  " session_reused=%d had_session=%d session_proto=%#x"
+                  " initial_handshake_done=%d xlio_sock=%d req_len=%zu",
+                  fd,
+                  (tls.client_session_cache != nullptr) ? "downstream"
+                                                         : "upstream",
+                  SSL_in_init(tls.ssl), SSL_session_reused(tls.ssl),
+                  SSL_get_session(tls.ssl) != nullptr,
+                  SSL_get_session(tls.ssl)
+                      ? SSL_SESSION_get_protocol_version(
+                            SSL_get_session(tls.ssl))
+                      : 0,
+                  tls.initial_handshake_done, static_cast<bool>(xlio_sock),
+                  data.size());
       return std::unexpected{Error::NETWORK};
     default:
       if (log_enabled(INFO)) {

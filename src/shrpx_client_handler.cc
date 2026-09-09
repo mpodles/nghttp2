@@ -35,6 +35,7 @@
 #endif // defined(HAVE_NETDB_H)
 
 #include <cerrno>
+#include <cstdlib>
 #include <algorithm>
 
 #include "shrpx_upstream.h"
@@ -57,6 +58,7 @@
 #endif // defined(ENABLE_HTTP3)
 #include "shrpx_log.h"
 #include "util.h"
+#include "probnik.h"
 #include "template.h"
 #include "tls.h"
 
@@ -252,8 +254,26 @@ std::expected<void, Error> ClientHandler::tls_handshake() {
    * the TLS record framing done by sockinfo_tcp_ops_tls::tcp_tx.
    */
   auto &xa = XlioAdapter::get();
-  if (xa.has_ultra_tx()) {
+  /*
+   * DIAGNOSTIC A/B SWITCH (temporary, added while investigating a spurious
+   * post-handshake "tlsv1 alert protocol version" on frontend reads that are
+   * timing-correlated with this call): set XLIO_SKIP_TLS_ULTRA_HANDLE=1 to
+   * skip acquiring the Ultra API handle for TLS frontend connections.  This
+   * handle is not consumed by anything on the TLS path yet (see note above),
+   * so skipping it should be functionally inert if the hypothesis is wrong,
+   * and should make the alert disappear if this call is in fact disturbing
+   * the fd's plain SSL_read() path. Remove once the hypothesis is settled.
+   */
+  const bool skip_ultra_handle = std::getenv("XLIO_SKIP_TLS_ULTRA_HANDLE") != nullptr;
+  if (xa.has_ultra_tx() && !skip_ultra_handle) {
+    PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                "BEFORE xa.socket_from_fd fd=%d this=%p (post-TLS-handshake"
+                " Ultra handle acquisition on a live fd)",
+                conn_.fd, (void *)&conn_);
     conn_.xlio_sock = xa.socket_from_fd(conn_.fd);
+    PROBNIK_LOG(PROBNIK_INFO, "tls-resume",
+                "AFTER xa.socket_from_fd fd=%d this=%p xlio_sock=%d",
+                conn_.fd, (void *)&conn_, static_cast<bool>(conn_.xlio_sock));
     if (log_enabled(INFO)) {
       if (conn_.xlio_sock) {
         Log{INFO, this} << "XLIO Ultra API handle acquired (sock="
